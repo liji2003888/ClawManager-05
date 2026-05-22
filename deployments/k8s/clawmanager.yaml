@@ -733,7 +733,7 @@ spec:
       containers:
         - name: mysql
           image: mysql:8.4.8
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 3306
           env:
@@ -800,7 +800,7 @@ spec:
       containers:
         - name: minio
           image: minio/minio:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args:
             - server
             - /data
@@ -869,7 +869,7 @@ spec:
       containers:
         - name: redis
           image: redis:7-alpine
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args:
             - redis-server
             - --appendonly
@@ -939,7 +939,7 @@ spec:
       containers:
         - name: skill-scanner
           image: ghcr.io/yuan-lab-llm/skill-scanner:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - /opt/skill-scanner-venv/bin/skill-scanner-api
             - --host
@@ -995,7 +995,7 @@ spec:
       containers:
         - name: clawmanager-app
           image: ghcr.io/yuan-lab-llm/clawmanager:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - name: https
               containerPort: 8443

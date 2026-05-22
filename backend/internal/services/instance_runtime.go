@@ -158,10 +158,22 @@ func usesWebtopImage(instanceType string) bool {
 }
 
 // defaultImagePullPolicy returns the image pull policy to use for instance
-// pods. Managed runtime instances always use IfNotPresent so local caches can
-// be reused without forcing a remote registry pull during create/start flows.
+// pods. csotai customization: default to Always so :latest tags always reach
+// the registry; operators in air-gapped envs can override via IMAGE_PULL_POLICY.
 func defaultImagePullPolicy() string {
-	return "IfNotPresent"
+	if override := strings.TrimSpace(os.Getenv("IMAGE_PULL_POLICY")); override != "" {
+		return override
+	}
+	return "Always"
+}
+
+// defaultSidecarImage returns the sidecar image to use for openclaw instances.
+// Configurable via SIDECAR_IMAGE environment variable. Empty disables sidecar.
+func defaultSidecarImage() string {
+	if img := strings.TrimSpace(os.Getenv("SIDECAR_IMAGE")); img != "" {
+		return img
+	}
+	return ""
 }
 
 func defaultEgressProxyURL() (string, bool) {

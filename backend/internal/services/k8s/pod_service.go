@@ -63,6 +63,12 @@ type PodConfig struct {
 	VolumeOwnershipFixes []VolumeOwnershipFix
 	SHMSizeGB            int
 	SecurityMode         PodSecurityMode
+	// OpenClaw cross-cluster sidecar / bootstrap (csotai customization)
+	SidecarEnabled       bool
+	SidecarImage         string
+	InitContainerEnabled bool
+	InitContainerImage   string
+	InitContainerToken   string
 }
 
 type PVCMount struct {
@@ -158,12 +164,7 @@ func (s *PodService) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 					Name:            "desktop",
 					Image:           config.Image,
 					ImagePullPolicy: pullPolicy,
-					Ports: []corev1.ContainerPort{
-						{
-							ContainerPort: config.ContainerPort,
-							Name:          "http",
-						},
-					},
+					Ports: openClawDesktopPorts(config.Type, config.ContainerPort),
 					StartupProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							TCPSocket: &corev1.TCPSocketAction{
@@ -327,6 +328,116 @@ func (s *PodService) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 		})
 	}
 
+	// Add init container for openclaw instances (csotai customization)
+	if config.InitContainerEnabled && config.InitContainerImage != "" {
+		initContainer := corev1.Container{
+			Name:            "bootstrap",
+			Image:           config.InitContainerImage,
+			ImagePullPolicy: corev1.PullAlways,
+			Command:         []string{"/bin/sh", "-c"},
+			Args: []string{`set -eu
+
+OPENCLAW_DIR="/config/.openclaw"
+OPENCLAW_CONFIG="${OPENCLAW_DIR}/openclaw.json"
+SENTINEL="/config/.bootstrap-v1.done"
+
+mkdir -p "$OPENCLAW_DIR" /config/workspace /config/skills /config/scripts
+
+if [ ! -f "$SENTINEL" ]; then
+  if [ -d /seed/workspace ]; then
+    cp -R /seed/workspace/. /config/workspace/
+  fi
+
+  if [ -d /seed/skills ]; then
+    cp -R /seed/skills/. /config/skills/
+  fi
+
+  if [ -d /seed/scripts ]; then
+    cp -R /seed/scripts/. /config/scripts/
+  fi
+fi
+
+if [ ! -f "$OPENCLAW_CONFIG" ]; then
+  TOKEN_ESCAPED="$(printf '%s' "$OPENCLAW_BOOTSTRAP_TOKEN" | sed 's/[\\/&]/\\\\&/g')"
+  sed "s/__GATEWAY_TOKEN__/${TOKEN_ESCAPED}/g" /seed/openclaw.json.tpl > "$OPENCLAW_CONFIG"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  OPENCLAW_CONFIG_TOKEN="$OPENCLAW_BOOTSTRAP_TOKEN" OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG" node <<'NODE'
+const fs = require('fs');
+
+const configPath = process.env.OPENCLAW_CONFIG_PATH;
+const raw = fs.readFileSync(configPath, 'utf8').trim();
+const config = raw ? JSON.parse(raw) : {};
+if (!config.gateway || typeof config.gateway !== 'object' || Array.isArray(config.gateway)) {
+  config.gateway = {};
+}
+if (!config.gateway.auth || typeof config.gateway.auth !== 'object' || Array.isArray(config.gateway.auth)) {
+  config.gateway.auth = {};
+}
+config.gateway.auth.mode = 'token';
+config.gateway.auth.token = process.env.OPENCLAW_CONFIG_TOKEN;
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+NODE
+else
+  echo "node is required to configure gateway.auth.token" >&2
+  exit 1
+fi
+
+chmod 600 "$OPENCLAW_CONFIG" || true
+touch "$SENTINEL"`},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "data",
+					MountPath: "/config",
+				},
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name:  "OPENCLAW_BOOTSTRAP_TOKEN",
+					Value: config.InitContainerToken,
+				},
+			},
+		}
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+	}
+
+	// Add sidecar container for openclaw instances (csotai customization)
+	if config.SidecarEnabled && config.SidecarImage != "" {
+		sidecarContainer := corev1.Container{
+			Name:            "sidecar",
+			Image:           config.SidecarImage,
+			ImagePullPolicy: corev1.PullAlways,
+			Ports: []corev1.ContainerPort{
+				{
+					ContainerPort: 5000,
+					Name:          "sidecar",
+				},
+				{
+					ContainerPort: 5001,
+					Name:          "sidecar-ext",
+				},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{
+					Name:      "data",
+					MountPath: "/config",
+				},
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name:  "INSTANCE_ID",
+					Value: fmt.Sprintf("%d", config.InstanceID),
+				},
+				{
+					Name:  "USER_ID",
+					Value: fmt.Sprintf("%d", config.UserID),
+				},
+			},
+		}
+		pod.Spec.Containers = append(pod.Spec.Containers, sidecarContainer)
+	}
+
 	createdPod, err := s.client.Clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		// Check if pod already exists
@@ -433,6 +544,24 @@ func normalizePodRuntimeType(runtimeType string) string {
 		return "shell"
 	}
 	return "desktop"
+}
+
+// openClawDesktopPorts returns the desktop container ports. For openclaw,
+// add the gateway port 18789 alongside the standard http port (csotai customization).
+func openClawDesktopPorts(instanceType string, containerPort int32) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{
+			ContainerPort: containerPort,
+			Name:          "http",
+		},
+	}
+	if instanceType == "openclaw" {
+		ports = append(ports, corev1.ContainerPort{
+			ContainerPort: 18789,
+			Name:          "gateway",
+		})
+	}
+	return ports
 }
 
 func intstrFromInt32(port int32) intstr.IntOrString {

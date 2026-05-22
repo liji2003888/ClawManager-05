@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +13,19 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// hostPathPVCFallbackEnabled reports whether the manual node-local hostPath PV
+// fallback is allowed. It is disabled by default because PVCs are provisioned by
+// an external StorageClass; opt in with K8S_PVC_HOSTPATH_FALLBACK=true only for
+// clusters without a working dynamic provisioner (csotai: c93d67c).
+func hostPathPVCFallbackEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("K8S_PVC_HOSTPATH_FALLBACK"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // PVCService handles PersistentVolumeClaim operations
 type PVCService struct {
@@ -74,8 +88,15 @@ func (s *PVCService) CreatePVC(ctx context.Context, userID, instanceID int, stor
 					corev1.ResourceStorage: storageSize,
 				},
 			},
-			StorageClassName: &storageClass,
 		},
+	}
+
+	// A nil StorageClassName makes Kubernetes use the cluster default class; a
+	// pointer to "" instead *disables* the default class, leaving the PVC
+	// permanently Pending (now that the hostPath fallback is off by default).
+	// (csotai customization: c93d67c)
+	if storageClass != "" {
+		pvc.Spec.StorageClassName = &storageClass
 	}
 
 	createdPVC, err := s.client.Clientset.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, pvc, metav1.CreateOptions{})
@@ -394,7 +415,16 @@ func (s *PVCService) waitForPVCBinding(ctx context.Context, namespace, pvcName s
 	for {
 		select {
 		case <-timeoutChan:
-			// Timeout, try to create PV manually
+			// A StorageClass-backed PVC (external NFS) must be bound by its
+			// provisioner; with WaitForFirstConsumer it stays Pending until the
+			// pod is scheduled, so substituting a node-local hostPath PV here
+			// would silently move "persistent" data onto node disk. Only fall
+			// back to a manual hostPath PV when explicitly opted in.
+			// (csotai customization: c93d67c)
+			if !hostPathPVCFallbackEnabled() {
+				fmt.Printf("PVC %s not bound within %s; leaving it to the provisioner (hostPath fallback disabled)\n", pvcName, timeout)
+				return nil, fmt.Errorf("PVC %s not bound within %s and hostPath fallback is disabled (set K8S_PVC_HOSTPATH_FALLBACK=true to enable)", pvcName, timeout)
+			}
 			fmt.Printf("PVC %s binding timeout, creating PV manually\n", pvcName)
 			return s.createPVForPVC(ctx, namespace, pvcName, userID, instanceID, storageSizeGB, storageClass)
 		case <-ticker.C:

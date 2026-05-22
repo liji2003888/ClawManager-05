@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -481,6 +482,16 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 		}
 	}
 
+	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
+	sidecarImage := defaultSidecarImage()
+	enableSidecar := strings.EqualFold(instance.Type, "openclaw") && sidecarImage != ""
+	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
+	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
+	initContainerToken := ""
+	if instance.AccessToken != nil {
+		initContainerToken = *instance.AccessToken
+	}
+
 	podConfig := k8s.PodConfig{
 		InstanceID:           instance.ID,
 		InstanceName:         instance.Name,
@@ -503,6 +514,11 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 		VolumeOwnershipFixes: volumeOwnershipFixes,
 		SHMSizeGB:            shmSizeGB,
 		SecurityMode:         s.securityModeForInstance(instance.Type),
+		SidecarEnabled:       enableSidecar,
+		SidecarImage:         sidecarImage,
+		InitContainerEnabled: enableInitContainer,
+		InitContainerImage:   openClawSeedImage,
+		InitContainerToken:   initContainerToken,
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
@@ -518,12 +534,19 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 
 	if instanceUsesDesktopRuntime(instance) {
 		// Create Service for browser desktop access.
+		additionalPorts := additionalServicePorts(runtimeConfig.Port)
+		if strings.EqualFold(instance.Type, "openclaw") {
+			additionalPorts = append(additionalPorts, openClawAdditionalServicePorts()...)
+		}
+		if enableSidecar {
+			additionalPorts = append(additionalPorts, 5000, 5001)
+		}
 		serviceConfig := k8s.ServiceConfig{
 			InstanceID:      instance.ID,
 			InstanceName:    instance.Name,
 			UserID:          userID,
 			ContainerPort:   runtimeConfig.Port,
-			AdditionalPorts: additionalServicePorts(runtimeConfig.Port),
+			AdditionalPorts: additionalPorts,
 		}
 
 		serviceInfo, err := s.serviceService.CreateService(ctx, serviceConfig)
@@ -660,25 +683,40 @@ func (s *instanceService) Start(instanceID int) error {
 		return fmt.Errorf("failed to delete network policy: %w", err)
 	}
 
+	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
+	sidecarImage := defaultSidecarImage()
+	enableSidecar := strings.EqualFold(instance.Type, "openclaw") && sidecarImage != ""
+	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
+	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
+	initContainerToken := ""
+	if instance.AccessToken != nil {
+		initContainerToken = *instance.AccessToken
+	}
+
 	shmSizeGB := popSHMSizeGB(extraEnv)
 	podConfig := k8s.PodConfig{
-		InstanceID:         instance.ID,
-		InstanceName:       instance.Name,
-		UserID:             instance.UserID,
-		Type:               instance.Type,
-		RuntimeType:        normalizeInstanceRuntimeType(instance.RuntimeType),
-		CPUCores:           instance.CPUCores,
-		MemoryGB:           instance.MemoryGB,
-		GPUEnabled:         instance.GPUEnabled,
-		GPUCount:           instance.GPUCount,
-		Image:              runtimeConfig.Image,
-		MountPath:          instance.MountPath,
-		ContainerPort:      runtimeConfig.Port,
-		ImagePullPolicy:    corev1.PullPolicy(defaultImagePullPolicy()),
-		ExtraEnv:           extraEnv,
-		EnvFromSecretNames: []string{bootstrapSecretName},
-		SHMSizeGB:          shmSizeGB,
-		SecurityMode:       s.securityModeForInstance(instance.Type),
+		InstanceID:           instance.ID,
+		InstanceName:         instance.Name,
+		UserID:               instance.UserID,
+		Type:                 instance.Type,
+		RuntimeType:          normalizeInstanceRuntimeType(instance.RuntimeType),
+		CPUCores:             instance.CPUCores,
+		MemoryGB:             instance.MemoryGB,
+		GPUEnabled:           instance.GPUEnabled,
+		GPUCount:             instance.GPUCount,
+		Image:                runtimeConfig.Image,
+		MountPath:            instance.MountPath,
+		ContainerPort:        runtimeConfig.Port,
+		ImagePullPolicy:      corev1.PullPolicy(defaultImagePullPolicy()),
+		ExtraEnv:             extraEnv,
+		EnvFromSecretNames:   []string{bootstrapSecretName},
+		SHMSizeGB:            shmSizeGB,
+		SecurityMode:         s.securityModeForInstance(instance.Type),
+		SidecarEnabled:       enableSidecar,
+		SidecarImage:         sidecarImage,
+		InitContainerEnabled: enableInitContainer,
+		InitContainerImage:   openClawSeedImage,
+		InitContainerToken:   initContainerToken,
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
@@ -690,12 +728,19 @@ func (s *instanceService) Start(instanceID int) error {
 		// Ensure Service exists (create if not exists)
 		serviceExists, _ := s.serviceService.ServiceExists(ctx, instance.UserID, instance.ID)
 		if !serviceExists {
+			additionalPorts := additionalServicePorts(runtimeConfig.Port)
+			if strings.EqualFold(instance.Type, "openclaw") {
+				additionalPorts = append(additionalPorts, openClawAdditionalServicePorts()...)
+			}
+			if enableSidecar {
+				additionalPorts = append(additionalPorts, 5000, 5001)
+			}
 			serviceConfig := k8s.ServiceConfig{
 				InstanceID:      instance.ID,
 				InstanceName:    instance.Name,
 				UserID:          instance.UserID,
 				ContainerPort:   runtimeConfig.Port,
-				AdditionalPorts: additionalServicePorts(runtimeConfig.Port),
+				AdditionalPorts: additionalPorts,
 			}
 			_, err = s.serviceService.CreateService(ctx, serviceConfig)
 			if err != nil {
@@ -1347,8 +1392,18 @@ func additionalServicePorts(primaryPort int32) []int32 {
 	if primaryPort == 3000 || primaryPort == 8082 {
 		return []int32{3000, 8082}
 	}
+	if primaryPort == 3001 {
+		return []int32{18789}
+	}
 
 	return nil
+}
+
+// openClawAdditionalServicePorts returns extra ports that openclaw instances
+// expose in addition to the runtime defaults (csotai customizations: feishu/5001
+// + gateway/18789).
+func openClawAdditionalServicePorts() []int32 {
+	return []int32{5001, 18789}
 }
 
 func normalizeInstanceRuntimeType(runtimeType string) string {

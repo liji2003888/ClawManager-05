@@ -4,6 +4,7 @@ import {
   modelService,
   type DiscoveredProviderModel,
   type LLMModel,
+  type LLMModelCustomHeader,
 } from '../../services/modelService';
 import { useI18n } from '../../contexts/I18nContext';
 import {
@@ -54,6 +55,7 @@ type EditableModelSnapshot = Pick<
   | 'provider_model_name'
   | 'api_key'
   | 'api_key_secret_ref'
+  | 'custom_headers'
   | 'is_secure'
   | 'is_active'
   | 'input_price'
@@ -73,6 +75,7 @@ const captureSnapshot = (card: EditableModel): EditableModelSnapshot => ({
   provider_model_name: card.provider_model_name,
   api_key: card.api_key,
   api_key_secret_ref: card.api_key_secret_ref,
+  custom_headers: card.custom_headers?.map((header) => ({ ...header })) ?? [],
   is_secure: card.is_secure,
   is_active: card.is_active,
   input_price: card.input_price,
@@ -93,6 +96,7 @@ const createEmptyModel = (): EditableModel => ({
   provider_model_name: '',
   api_key: '',
   api_key_secret_ref: '',
+  custom_headers: [],
   is_secure: false,
   is_active: true,
   input_price: 0,
@@ -142,6 +146,15 @@ function canDiscover(card: EditableModel) {
   }
 
   return true;
+}
+
+function normalizeCustomHeaders(headers?: LLMModelCustomHeader[]) {
+  return (headers ?? [])
+    .map((header) => ({
+      key: header.key.trim(),
+      value: header.value.trim(),
+    }))
+    .filter((header) => header.key || header.value);
 }
 
 function getProviderTypeLabel(providerType: string) {
@@ -508,6 +521,7 @@ const ModelManagementPage: React.FC = () => {
           protocol_type: resolveProviderProtocolType(item.provider_type, item.protocol_type),
           api_key: item.api_key ?? '',
           api_key_secret_ref: item.api_key_secret_ref ?? '',
+          custom_headers: item.custom_headers ?? [],
           local_id: `${item.id ?? item.display_name}-${index}`,
           isEditing: false,
           error: null,
@@ -598,6 +612,45 @@ const ModelManagementPage: React.FC = () => {
       }
       return next;
     }));
+  };
+
+  const addCustomHeader = (localId: string) => {
+    setModels((current) => current.map((card) => (
+      card.local_id === localId
+        ? {
+            ...card,
+            custom_headers: [...(card.custom_headers ?? []), { key: '', value: '' }],
+            error: null,
+          }
+        : card
+    )));
+  };
+
+  const updateCustomHeader = (localId: string, index: number, patch: Partial<LLMModelCustomHeader>) => {
+    setModels((current) => current.map((card) => {
+      if (card.local_id !== localId) {
+        return card;
+      }
+
+      const customHeaders = [...(card.custom_headers ?? [])];
+      customHeaders[index] = {
+        ...(customHeaders[index] ?? { key: '', value: '' }),
+        ...patch,
+      };
+      return { ...card, custom_headers: customHeaders, error: null };
+    }));
+  };
+
+  const removeCustomHeader = (localId: string, index: number) => {
+    setModels((current) => current.map((card) => (
+      card.local_id === localId
+        ? {
+            ...card,
+            custom_headers: (card.custom_headers ?? []).filter((_, itemIndex) => itemIndex !== index),
+            error: null,
+          }
+        : card
+    )));
   };
 
   const startEditing = (card: EditableModel) => {
@@ -695,6 +748,12 @@ const ModelManagementPage: React.FC = () => {
       return;
     }
 
+    const customHeaders = normalizeCustomHeaders(card.custom_headers);
+    if (customHeaders.some((header) => !header.key || !header.value)) {
+      updateCard(card.local_id, { error: t('modelManagementPage.customHeadersRequired') });
+      return;
+    }
+
     updateCard(card.local_id, { saving: true, error: null });
 
     try {
@@ -708,6 +767,7 @@ const ModelManagementPage: React.FC = () => {
         provider_model_name: card.provider_model_name.trim(),
         api_key: card.api_key?.trim() || undefined,
         api_key_secret_ref: card.api_key_secret_ref?.trim() || undefined,
+        custom_headers: customHeaders,
         is_secure: card.is_secure,
         is_active: card.is_active,
         input_price: Number(card.input_price) || 0,
@@ -723,6 +783,7 @@ const ModelManagementPage: React.FC = () => {
               description: saved.description ?? '',
               api_key: saved.api_key ?? '',
               api_key_secret_ref: saved.api_key_secret_ref ?? '',
+              custom_headers: saved.custom_headers ?? [],
               isNew: false,
               isEditing: false,
               saving: false,
@@ -797,6 +858,10 @@ const ModelManagementPage: React.FC = () => {
               {models.map((card) => {
                 const autoDiscoverySupported = AUTO_DISCOVERY_PROVIDERS.has(card.provider_type);
                 const discoveredModels = card.discovered_models ?? [];
+                const customHeaders = card.custom_headers ?? [];
+                const customHeaderKeys = customHeaders
+                  .map((header) => header.key.trim())
+                  .filter(Boolean);
                 const currentTemplate = getSelectedTemplate(card, t('modelManagementPage.currentVendorTemplate'));
                 const templateOptions = getTemplateOptions(card, t('modelManagementPage.currentVendorTemplate'));
                 const effectiveProtocolType = resolveProviderProtocolType(card.provider_type, card.protocol_type);
@@ -867,6 +932,12 @@ const ModelManagementPage: React.FC = () => {
                         <div className="sm:col-span-2">
                           <dt className="font-medium text-gray-700">{t('modelManagementPage.baseUrl')}</dt>
                           <dd className="mt-1 break-all text-gray-600">{card.base_url || '-'}</dd>
+                        </div>
+                        <div className="sm:col-span-2">
+                          <dt className="font-medium text-gray-700">{t('modelManagementPage.customHeaders')}</dt>
+                          <dd className="mt-1 text-gray-600">
+                            {customHeaderKeys.length > 0 ? customHeaderKeys.join(', ') : t('modelManagementPage.noCustomHeaders')}
+                          </dd>
                         </div>
                         <div>
                           <dt className="font-medium text-gray-700">{t('modelManagementPage.inputPriceShort')}</dt>
@@ -1012,6 +1083,55 @@ const ModelManagementPage: React.FC = () => {
                           placeholder={t('modelManagementPage.secretRefPlaceholder')}
                         />
                       </div>
+                    </div>
+
+                    <div className="mt-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <label className="block text-sm font-medium text-gray-700">{t('modelManagementPage.customHeaders')}</label>
+                        <button
+                          type="button"
+                          onClick={() => addCustomHeader(card.local_id)}
+                          className="rounded-xl border border-[#ead8cf] bg-white px-3 py-1 text-xs font-medium text-[#7c5a4d] hover:bg-[#fff5f0]"
+                        >
+                          {t('modelManagementPage.addHeader')}
+                        </button>
+                      </div>
+
+                      {customHeaders.length > 0 ? (
+                        <div className="mt-2 space-y-2">
+                          {customHeaders.map((header, index) => (
+                            <div key={`${card.local_id}-header-${index}`} className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)_auto]">
+                              <input
+                                type="text"
+                                value={header.key}
+                                onChange={(event) => updateCustomHeader(card.local_id, index, { key: event.target.value })}
+                                className="app-input block w-full"
+                                placeholder={t('modelManagementPage.headerKeyPlaceholder')}
+                              />
+                              <input
+                                type="text"
+                                value={header.value}
+                                onChange={(event) => updateCustomHeader(card.local_id, index, { value: event.target.value })}
+                                className="app-input block w-full"
+                                placeholder={t('modelManagementPage.headerValuePlaceholder')}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => removeCustomHeader(card.local_id, index)}
+                                className="rounded-xl border border-[#ead8cf] bg-white px-3 py-2 text-xs font-medium text-[#8f5a47] hover:bg-[#fff5f0]"
+                                aria-label={t('modelManagementPage.removeHeader')}
+                              >
+                                {t('common.delete')}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mt-2 rounded-[18px] border border-dashed border-[#ead8cf] px-4 py-3 text-sm text-gray-500">
+                          {t('modelManagementPage.noCustomHeaders')}
+                        </div>
+                      )}
+                      <p className="mt-2 text-xs text-gray-500">{t('modelManagementPage.customHeadersHelp')}</p>
                     </div>
 
                     <div className="mt-4">

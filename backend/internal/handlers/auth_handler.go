@@ -21,7 +21,7 @@ func NewAuthHandler(authService services.AuthService) *AuthHandler {
 
 // RegisterRequest represents a registration request
 type RegisterRequest struct {
-	Username string `json:"username" binding:"required,min=3,max=32,alphanum"`
+	Username string `json:"username" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 	Password string `json:"password" binding:"required,min=8"`
 }

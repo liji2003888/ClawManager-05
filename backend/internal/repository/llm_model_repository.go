@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS llm_models (
   provider_model_name VARCHAR(255) NOT NULL,
   api_key TEXT NULL,
   api_key_secret_ref VARCHAR(255) NULL,
+  custom_headers_json LONGTEXT NULL,
   is_secure BOOLEAN NOT NULL DEFAULT FALSE,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   input_price DECIMAL(18,8) NOT NULL DEFAULT 0,
@@ -86,6 +87,17 @@ WHERE protocol_type IS NULL OR TRIM(protocol_type) = '';
 
 	if _, err := r.sess.SQL().Exec(backfillProtocolTypeQuery); err != nil {
 		panic(fmt.Errorf("failed to ensure llm_models protocol_type column: %w", err))
+	}
+
+	const alterCustomHeadersQuery = `
+ALTER TABLE llm_models
+  ADD COLUMN custom_headers_json LONGTEXT NULL AFTER api_key_secret_ref;
+`
+
+	if _, err := r.sess.SQL().Exec(alterCustomHeadersQuery); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			panic(fmt.Errorf("failed to ensure llm_models custom_headers_json column: %w", err))
+		}
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -121,6 +122,8 @@ const anthropicVersionHeader = "2023-06-01"
 const defaultAnthropicMaxTokens = 4096
 
 var providerVersionSegmentPattern = regexp.MustCompile(`(?i)^v\d+(?:[a-z0-9._-]*)?$`)
+var customHeaderTemplatePattern = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}|\$\{\s*([A-Za-z0-9_.-]+)\s*\}`)
+var customHeaderNamePattern = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 type preparedChatRequest struct {
 	traceID       string
@@ -130,6 +133,7 @@ type preparedChatRequest struct {
 	requestIDPtr  *string
 	userID        int
 	userIDPtr     *int
+	instance      *models.Instance
 	selectedModel *models.LLMModel
 	resolvedModel *models.LLMModel
 	req           ChatCompletionRequest
@@ -277,6 +281,7 @@ type Service interface {
 
 type service struct {
 	modelRepo          repository.LLMModelRepository
+	instanceRepo       repository.InstanceRepository
 	invocationService  services.ModelInvocationService
 	auditEventService  services.AuditEventService
 	costRecordService  services.CostRecordService
@@ -291,6 +296,7 @@ type service struct {
 // NewService creates a new AI gateway service.
 func NewService(
 	modelRepo repository.LLMModelRepository,
+	instanceRepo repository.InstanceRepository,
 	invocationService services.ModelInvocationService,
 	auditEventService services.AuditEventService,
 	costRecordService services.CostRecordService,
@@ -301,6 +307,7 @@ func NewService(
 ) Service {
 	return &service{
 		modelRepo:          modelRepo,
+		instanceRepo:       instanceRepo,
 		invocationService:  invocationService,
 		auditEventService:  auditEventService,
 		costRecordService:  costRecordService,
@@ -426,6 +433,19 @@ func (s *service) prepareChatRequest(userID int, req ChatCompletionRequest) (*pr
 	prepared.req.SessionID = prepared.sessionIDPtr
 	prepared.requestID = normalizeOrCreateID(req.RequestID, "req")
 	prepared.requestIDPtr = stringPtr(prepared.requestID)
+	if prepared.req.InstanceID != nil && s.instanceRepo != nil {
+		instance, err := s.instanceRepo.GetByID(*prepared.req.InstanceID)
+		if err != nil {
+			return prepared, fmt.Errorf("failed to get instance: %w", err)
+		}
+		if instance == nil {
+			return prepared, errors.New("instance not found")
+		}
+		if instance.UserID != userID {
+			return prepared, errors.New("access denied")
+		}
+		prepared.instance = instance
+	}
 
 	sessionTitle := deriveSessionTitle(prepared.req.Messages)
 	if _, err := s.chatSessionService.EnsureSession(prepared.sessionID, prepared.userIDPtr, prepared.req.InstanceID, stringPtr(prepared.traceID), sessionTitle); err != nil {
@@ -533,7 +553,7 @@ func (s *service) callOpenAICompatible(ctx context.Context, prepared *preparedCh
 		return nil, prepared.traceID, err
 	}
 
-	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, false)
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, false, prepared.customHeaderVariables())
 	if err != nil {
 		return nil, prepared.traceID, err
 	}
@@ -589,7 +609,7 @@ func (s *service) callAnthropic(ctx context.Context, prepared *preparedChatReque
 		return nil, prepared.traceID, err
 	}
 
-	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, false)
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, false, prepared.customHeaderVariables())
 	if err != nil {
 		return nil, prepared.traceID, err
 	}
@@ -809,7 +829,7 @@ func (s *service) streamOpenAICompatible(ctx context.Context, prepared *prepared
 		return err
 	}
 
-	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, true)
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, true, prepared.customHeaderVariables())
 	if err != nil {
 		return err
 	}
@@ -898,7 +918,7 @@ func (s *service) streamAnthropic(ctx context.Context, prepared *preparedChatReq
 		return err
 	}
 
-	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, true)
+	httpRequest, err := buildProviderHTTPRequest(ctx, prepared.traceID, prepared.requestID, prepared.resolvedModel, providerRequestBody, resolvedAPIKey, true, prepared.customHeaderVariables())
 	if err != nil {
 		return err
 	}
@@ -1371,17 +1391,197 @@ func buildAnthropicRequestBody(req ChatCompletionRequest, model *models.LLMModel
 	return body, nil
 }
 
-func buildProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {
+func buildProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool, variables map[string]string) (*http.Request, error) {
 	if model == nil {
 		return nil, errors.New("model is not active or does not exist")
 	}
 
+	var httpRequest *http.Request
+	var err error
 	switch models.ResolveLLMProtocolTypeOrDefault(model.ProviderType, model.ProtocolType) {
 	case models.ProtocolTypeAnthropic:
-		return buildAnthropicProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
+		httpRequest, err = buildAnthropicProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
 	default:
-		return buildOpenAICompatibleProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
+		httpRequest, err = buildOpenAICompatibleProviderHTTPRequest(ctx, traceID, requestID, model, providerRequestBody, resolvedAPIKey, acceptStream)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := applyCustomProviderHeaders(httpRequest, model, variables); err != nil {
+		return nil, err
+	}
+	return httpRequest, nil
+}
+
+func applyCustomProviderHeaders(httpRequest *http.Request, model *models.LLMModel, variables map[string]string) error {
+	if httpRequest == nil || model == nil {
+		return nil
+	}
+
+	headers, err := models.ParseLLMModelCustomHeaders(model.CustomHeadersJSON)
+	if err != nil {
+		return fmt.Errorf("custom header config is invalid: %w", err)
+	}
+	for _, header := range headers {
+		key := strings.TrimSpace(header.Key)
+		if key == "" {
+			continue
+		}
+		if strings.ContainsAny(key, "\r\n") || !customHeaderNamePattern.MatchString(key) {
+			return fmt.Errorf("custom header key is invalid: %s", key)
+		}
+		value := renderCustomHeaderValue(header.Value, variables)
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("custom header value for %s cannot contain newlines", key)
+		}
+		httpRequest.Header.Set(key, value)
+	}
+	return nil
+}
+
+func renderCustomHeaderValue(template string, variables map[string]string) string {
+	if strings.TrimSpace(template) == "" || len(variables) == 0 {
+		return template
+	}
+
+	return customHeaderTemplatePattern.ReplaceAllStringFunc(template, func(match string) string {
+		parts := customHeaderTemplatePattern.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return ""
+		}
+		key := strings.TrimSpace(parts[1])
+		if key == "" {
+			key = strings.TrimSpace(parts[2])
+		}
+		if key == "" {
+			return ""
+		}
+		return variables[strings.ToLower(key)]
+	})
+}
+
+func (p *preparedChatRequest) customHeaderVariables() map[string]string {
+	variables := map[string]string{}
+	if p == nil {
+		return variables
+	}
+
+	addHeaderVariable(variables, "user.id", strconv.Itoa(p.userID))
+	addHeaderVariable(variables, "user_id", strconv.Itoa(p.userID))
+	addHeaderVariable(variables, "clawmanager.user_id", strconv.Itoa(p.userID))
+	addHeaderVariable(variables, "CLAWMANAGER_USER_ID", strconv.Itoa(p.userID))
+	addHeaderVariable(variables, "request.trace_id", p.traceID)
+	addHeaderVariable(variables, "trace_id", p.traceID)
+	addHeaderVariable(variables, "clawmanager.trace_id", p.traceID)
+	addHeaderVariable(variables, "CLAWMANAGER_TRACE_ID", p.traceID)
+	addHeaderVariable(variables, "request.request_id", p.requestID)
+	addHeaderVariable(variables, "request_id", p.requestID)
+	addHeaderVariable(variables, "clawmanager.request_id", p.requestID)
+	addHeaderVariable(variables, "CLAWMANAGER_REQUEST_ID", p.requestID)
+	addHeaderVariable(variables, "request.session_id", p.sessionID)
+	addHeaderVariable(variables, "session_id", p.sessionID)
+	addHeaderVariable(variables, "clawmanager.session_id", p.sessionID)
+	addHeaderVariable(variables, "CLAWMANAGER_SESSION_ID", p.sessionID)
+	addHeaderVariable(variables, "request.model", p.req.Model)
+	addHeaderVariable(variables, "requested_model", p.req.Model)
+
+	if p.resolvedModel != nil {
+		addHeaderVariable(variables, "model.id", strconv.Itoa(p.resolvedModel.ID))
+		addHeaderVariable(variables, "model.display_name", p.resolvedModel.DisplayName)
+		addHeaderVariable(variables, "model.provider_type", p.resolvedModel.ProviderType)
+		addHeaderVariable(variables, "model.protocol_type", p.resolvedModel.ProtocolType)
+		addHeaderVariable(variables, "model.provider_model_name", p.resolvedModel.ProviderModelName)
+		addHeaderVariable(variables, "provider_model_name", p.resolvedModel.ProviderModelName)
+		addHeaderVariable(variables, "CLAWMANAGER_MODEL", p.resolvedModel.DisplayName)
+		addHeaderVariable(variables, "CLAWMANAGER_PROVIDER_MODEL", p.resolvedModel.ProviderModelName)
+	}
+
+	instanceID := 0
+	if p.req.InstanceID != nil {
+		instanceID = *p.req.InstanceID
+	}
+	if p.instance != nil {
+		instanceID = p.instance.ID
+	}
+	if instanceID > 0 {
+		instanceIDText := strconv.Itoa(instanceID)
+		addHeaderVariable(variables, "instance.id", instanceIDText)
+		addHeaderVariable(variables, "instance_id", instanceIDText)
+		addHeaderVariable(variables, "openclaw.instance_id", instanceIDText)
+		addHeaderVariable(variables, "clawmanager.instance_id", instanceIDText)
+		addHeaderVariable(variables, "OPENCLAW_INSTANCE_ID", instanceIDText)
+		addHeaderVariable(variables, "CLAWMANAGER_INSTANCE_ID", instanceIDText)
+	}
+	if p.instance != nil {
+		addInstanceHeaderVariables(variables, p.instance)
+	}
+
+	return variables
+}
+
+func addInstanceHeaderVariables(variables map[string]string, instance *models.Instance) {
+	if instance == nil {
+		return
+	}
+
+	addHeaderVariable(variables, "instance.user_id", strconv.Itoa(instance.UserID))
+	addHeaderVariable(variables, "instance.name", instance.Name)
+	addHeaderVariable(variables, "instance.type", instance.Type)
+	addHeaderVariable(variables, "instance.status", instance.Status)
+	addHeaderVariable(variables, "instance.cpu_cores", strconv.FormatFloat(instance.CPUCores, 'f', -1, 64))
+	addHeaderVariable(variables, "instance.memory_gb", strconv.Itoa(instance.MemoryGB))
+	addHeaderVariable(variables, "instance.disk_gb", strconv.Itoa(instance.DiskGB))
+	addHeaderVariable(variables, "instance.gpu_enabled", strconv.FormatBool(instance.GPUEnabled))
+	addHeaderVariable(variables, "instance.gpu_count", strconv.Itoa(instance.GPUCount))
+	addHeaderVariable(variables, "instance.os_type", instance.OSType)
+	addHeaderVariable(variables, "instance.os_version", instance.OSVersion)
+	addHeaderVariable(variables, "instance.storage_class", instance.StorageClass)
+	addHeaderVariable(variables, "instance.mount_path", instance.MountPath)
+	addOptionalHeaderVariable(variables, "instance.image_registry", instance.ImageRegistry)
+	addOptionalHeaderVariable(variables, "instance.image_tag", instance.ImageTag)
+	addOptionalHeaderVariable(variables, "instance.pod_name", instance.PodName)
+	addOptionalHeaderVariable(variables, "instance.pod_namespace", instance.PodNamespace)
+	addOptionalHeaderVariable(variables, "instance.pod_ip", instance.PodIP)
+	addHeaderVariable(variables, "openclaw.instance_name", instance.Name)
+	addHeaderVariable(variables, "clawmanager.instance_name", instance.Name)
+	addHeaderVariable(variables, "OPENCLAW_INSTANCE_NAME", instance.Name)
+	addHeaderVariable(variables, "CLAWMANAGER_INSTANCE_NAME", instance.Name)
+	addInstanceEnvHeaderVariables(variables, instance.EnvironmentOverridesJSON)
+}
+
+func addInstanceEnvHeaderVariables(variables map[string]string, raw *string) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return
+	}
+
+	var env map[string]string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(*raw)), &env); err != nil {
+		return
+	}
+	for key, value := range env {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		addHeaderVariable(variables, "env."+key, value)
+		addHeaderVariable(variables, "instance.env."+key, value)
+		addHeaderVariable(variables, "clawmanager.env."+key, value)
+	}
+}
+
+func addOptionalHeaderVariable(variables map[string]string, key string, value *string) {
+	if value == nil {
+		return
+	}
+	addHeaderVariable(variables, key, *value)
+}
+
+func addHeaderVariable(variables map[string]string, key, value string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	variables[strings.ToLower(key)] = value
 }
 
 func buildOpenAICompatibleProviderHTTPRequest(ctx context.Context, traceID, requestID string, model *models.LLMModel, providerRequestBody []byte, resolvedAPIKey *string, acceptStream bool) (*http.Request, error) {

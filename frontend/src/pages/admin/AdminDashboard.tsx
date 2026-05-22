@@ -18,7 +18,7 @@ interface ClusterMetricCardProps {
   eyebrow: string;
   value: string;
   subtitle: string;
-  progress: number;
+  progress: number | null;
   tone: 'coral' | 'amber' | 'blue' | 'slate';
 }
 
@@ -301,10 +301,28 @@ const AdminDashboard: React.FC = () => {
           <ClusterMetricCard
             tone="slate"
             eyebrow={t('admin.persistentAllocation')}
-            title={t('common.disk')}
-            value={loading || !clusterResources ? '--' : `${formatValue(clusterResources.disk.requested)} / ${formatValue(clusterResources.disk.allocatable)} GiB`}
-            subtitle={loading || !clusterResources ? t('admin.allocatedVsAllocatable') : t('admin.capacityGiB', { value: formatValue(clusterResources.disk.capacity) })}
-            progress={usagePercent(clusterResources?.disk)}
+            title={t('admin.persistentStorage')}
+            value={
+              loading || !clusterResources
+                ? '--'
+                : clusterResources.disk.allocatable > 0
+                  ? `${formatValue(clusterResources.disk.requested)} / ${formatValue(clusterResources.disk.allocatable)} GiB`
+                  : `${formatValue(clusterResources.disk.requested)} GiB`
+            }
+            subtitle={
+              loading || !clusterResources
+                ? t('admin.allocatedVsAllocatable')
+                : clusterResources.disk.allocatable > 0
+                  ? t('admin.capacityGiB', { value: formatValue(clusterResources.disk.capacity) })
+                  : t('admin.persistentAllocation')
+            }
+            progress={
+              loading || !clusterResources
+                ? 0
+                : clusterResources.disk.allocatable > 0
+                  ? usagePercent(clusterResources.disk)
+                  : null
+            }
           />
         </div>
       </section>
@@ -515,7 +533,7 @@ function ClusterMetricCard({ title, eyebrow, value, subtitle, progress, tone }: 
           <h3 className="mt-2 text-[1.35rem] font-semibold leading-6 text-[#1d1713]">{title}</h3>
         </div>
         <div className="rounded-full border border-[#efe2d9] bg-white/85 px-3 py-1 text-xs font-semibold text-[#7a6d66] shadow-[0_10px_24px_-20px_rgba(72,44,24,0.55)]">
-          {Math.round(progress)}%
+          {progress === null ? '--' : `${Math.round(progress)}%`}
         </div>
       </div>
       <div className="mt-4 rounded-[22px] border border-[#f1e2d8] bg-[linear-gradient(180deg,rgba(255,255,255,0.92)_0%,rgba(255,249,245,0.88)_100%)] px-4 py-4">
@@ -523,7 +541,9 @@ function ClusterMetricCard({ title, eyebrow, value, subtitle, progress, tone }: 
           {value}
         </p>
         <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-white/90">
-          <div className={`h-full rounded-full transition-all ${style.line}`} style={{ width: `${progress}%` }} />
+          {progress !== null && (
+            <div className={`h-full rounded-full transition-all ${style.line}`} style={{ width: `${progress}%` }} />
+          )}
         </div>
         <div className="mt-4 flex items-end justify-between gap-3">
           <p className="text-[13px] leading-5 text-[#7a6d66]">{subtitle}</p>

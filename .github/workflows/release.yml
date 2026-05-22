@@ -194,7 +194,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push multi-platform release image
+      - name: Push multi-platform release image to GHCR
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -204,6 +204,24 @@ jobs:
           tags: |
             ${{ env.IMAGE_URI }}:${{ env.TAG_NAME }}
             ${{ env.IMAGE_URI }}:latest
+
+      - name: Log in to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY || 'crpi-p7zet5k9t1r8eu0j.cn-shenzhen.personal.cr.aliyuncs.com' }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Push multi-platform release image to Aliyun
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.ALIYUN_REGISTRY || 'crpi-p7zet5k9t1r8eu0j.cn-shenzhen.personal.cr.aliyuncs.com' }}/yangkin/clawmanager:${{ env.TAG_NAME }}
+            ${{ secrets.ALIYUN_REGISTRY || 'crpi-p7zet5k9t1r8eu0j.cn-shenzhen.personal.cr.aliyuncs.com' }}/yangkin/clawmanager:latest
 
       - name: Read pushed image digest
         shell: bash

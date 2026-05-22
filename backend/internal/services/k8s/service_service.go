@@ -62,27 +62,7 @@ func (s *ServiceService) CreateService(ctx context.Context, config ServiceConfig
 		targetPort = 3001
 	}
 
-	servicePorts := []corev1.ServicePort{
-		{
-			Name:       "http",
-			Port:       targetPort,
-			TargetPort: intstr.FromInt(int(targetPort)),
-			Protocol:   corev1.ProtocolTCP,
-		},
-	}
-
-	for _, additionalPort := range config.AdditionalPorts {
-		if additionalPort == 0 || additionalPort == targetPort {
-			continue
-		}
-
-		servicePorts = append(servicePorts, corev1.ServicePort{
-			Name:       fmt.Sprintf("tcp-%d", additionalPort),
-			Port:       additionalPort,
-			TargetPort: intstr.FromInt(int(additionalPort)),
-			Protocol:   corev1.ProtocolTCP,
-		})
-	}
+	servicePorts := buildServicePorts(targetPort, config.AdditionalPorts)
 
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -125,6 +105,40 @@ func (s *ServiceService) CreateService(ctx context.Context, config ServiceConfig
 		NodePort:   0,
 		TargetPort: targetPort,
 	}, nil
+}
+
+// buildServicePorts builds the list of ServicePort entries, deduplicating
+// targetPort/additionalPorts so re-created Services don't fail nodeport
+// allocation (csotai fix: 83733f6).
+func buildServicePorts(targetPort int32, additionalPorts []int32) []corev1.ServicePort {
+	servicePorts := []corev1.ServicePort{
+		{
+			Name:       "http",
+			Port:       targetPort,
+			TargetPort: intstr.FromInt(int(targetPort)),
+			Protocol:   corev1.ProtocolTCP,
+		},
+	}
+	seenPorts := map[int32]struct{}{targetPort: {}}
+
+	for _, additionalPort := range additionalPorts {
+		if additionalPort == 0 {
+			continue
+		}
+		if _, exists := seenPorts[additionalPort]; exists {
+			continue
+		}
+		seenPorts[additionalPort] = struct{}{}
+
+		servicePorts = append(servicePorts, corev1.ServicePort{
+			Name:       fmt.Sprintf("tcp-%d", additionalPort),
+			Port:       additionalPort,
+			TargetPort: intstr.FromInt(int(additionalPort)),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
+
+	return servicePorts
 }
 
 // GetService gets a service by instance ID

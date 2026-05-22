@@ -112,7 +112,7 @@ func main() {
 	teamService := services.NewTeamService(teamRepo, instanceService)
 	skillService := services.NewSkillService(skillRepo, instanceRepo, instanceCommandService, objectStorageService, skillScannerClient)
 	securityScanService := services.NewSecurityScanService(securityScanRepo, skillRepo, objectStorageService, skillScannerClient)
-	aiGatewayService := aigateway.NewService(llmModelRepo, modelInvocationService, auditEventService, costRecordService, riskDetectionService, riskHitService, chatSessionService, chatMessageService)
+	aiGatewayService := aigateway.NewService(llmModelRepo, instanceRepo, modelInvocationService, auditEventService, costRecordService, riskDetectionService, riskHitService, chatSessionService, chatMessageService)
 
 	// Initialize handlers
 	authHandler := handlers.NewAuthHandler(authService)
@@ -130,6 +130,7 @@ func main() {
 	securityHandler := handlers.NewSecurityHandler(securityScanService)
 	agentHandler := handlers.NewAgentHandler(instanceAgentService, instanceCommandService, instanceRuntimeStatusService, instanceConfigRevisionService, skillService)
 	teamHandler := handlers.NewTeamHandler(teamService)
+	internalHandler := handlers.NewInternalHandler(instanceService, userService)
 
 	// Initialize WebSocket hub and handler
 	wsHub := services.GetHub()
@@ -390,6 +391,26 @@ func main() {
 		{
 			ws.GET("", wsHandler.HandleWebSocket)
 			ws.GET("/stats", wsHandler.GetConnectionCount)
+		}
+
+		// Internal bootstrap routes (internal token only, no user JWT/admin required)
+		bootstrap := api.Group("/internal/bootstrap")
+		bootstrap.Use(internalHandler.InternalAuthMiddleware())
+		{
+			bootstrap.POST("/users", internalHandler.BootstrapCreateUser)
+			bootstrap.GET("/users/:username", internalHandler.BootstrapGetUserByUsername)
+			bootstrap.POST("/users/:userId/instances", internalHandler.BootstrapCreateInstance)
+			bootstrap.DELETE("/instances/:id", internalHandler.BootstrapDeleteInstance)
+		}
+
+		// Internal API routes (for cross-cluster services like Five-Star AI)
+		internal := api.Group("/internal")
+		internal.Use(internalHandler.InternalAuthMiddleware())
+		{
+			internal.POST("/login", internalHandler.InternalLogin)
+			internal.GET("/instances", internalHandler.ListInstances)
+			internal.GET("/instances/:id", internalHandler.GetInstance)
+			internal.POST("/instances/:id/restart", internalHandler.RestartInstance)
 		}
 	}
 

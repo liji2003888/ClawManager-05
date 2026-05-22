@@ -490,6 +490,9 @@ func (s *InstanceProxyService) getAdditionalPorts(targetPort int32) []int32 {
 	if targetPort == 3000 || targetPort == 8082 {
 		return []int32{3000, 8082}
 	}
+	if targetPort == 3001 {
+		return []int32{18789}
+	}
 
 	return nil
 }

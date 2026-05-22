@@ -3,7 +3,9 @@ package services
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"clawreef/internal/repository"
@@ -131,9 +133,6 @@ func (s *clusterResourceService) GetOverview(ctx context.Context) (*ClusterResou
 		overview.Memory.Capacity += detail.Memory.Capacity
 		overview.Memory.Allocatable += detail.Memory.Allocatable
 		overview.Memory.Requested += detail.Memory.Requested
-		overview.Disk.Capacity += detail.Disk.Capacity
-		overview.Disk.Allocatable += detail.Disk.Allocatable
-		overview.Disk.Requested += detail.Disk.Requested
 
 		overview.Nodes = append(overview.Nodes, detail)
 	}
@@ -149,6 +148,19 @@ func (s *clusterResourceService) GetOverview(ctx context.Context) (*ClusterResou
 			totalAllocatedStorage += instance.DiskGB
 		}
 		overview.Disk.Requested = float64(totalAllocatedStorage)
+	}
+
+	// Persistent storage is provisioned by the StorageClass (external NFS), which
+	// is unrelated to node ephemeral-storage. We deliberately do not derive a
+	// ceiling from node local disk; report a capacity only if the operator
+	// configured the real backing-store size, otherwise leave it uncapped.
+	// (csotai customization: c93d67c)
+	if capacityGB := persistentStorageCapacityGB(); capacityGB > 0 {
+		overview.Disk.Capacity = capacityGB
+		overview.Disk.Allocatable = capacityGB
+	} else {
+		overview.Disk.Capacity = 0
+		overview.Disk.Allocatable = 0
 	}
 
 	sort.Slice(overview.Nodes, func(i, j int) bool {
@@ -200,4 +212,19 @@ func cpuQuantityToCores(q resource.Quantity) float64 {
 
 func bytesToGiB(q resource.Quantity) float64 {
 	return float64(q.Value()) / 1024 / 1024 / 1024
+}
+
+// persistentStorageCapacityGB returns the operator-configured size of the
+// persistent-storage backend (e.g. the NFS export) in GiB, or 0 when unset so
+// the overview reports allocated storage without a ceiling (csotai: c93d67c).
+func persistentStorageCapacityGB() float64 {
+	raw := strings.TrimSpace(os.Getenv("CLUSTER_PERSISTENT_STORAGE_GB"))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
 }

@@ -1,4 +1,4 @@
-.PHONY: build run test clean docker-build docker-up docker-down migrate
+.PHONY: build run test clean docker-build docker-up docker-down migrate push-aliyun
 
 # Variables
 APP_NAME=clawreef
@@ -44,6 +44,10 @@ docker-up:
 
 docker-down:
 	docker-compose -f deployments/docker/docker-compose.yml down
+
+# Push image to Aliyun
+push-aliyun:
+	@cd .. && ./push-image.sh latest
 
 # Database migration (requires mysql client)
 migrate:

@@ -111,6 +111,28 @@ func buildInstancePodEnv(instance *models.Instance, runtimeEnv, gatewayEnv, agen
 		delete(resolved, "SUBFOLDER")
 	}
 	resolved = mergeEnvMaps(resolved, overrides)
+	resolved = withOpenClawGatewayTokenEnv(instance, resolved)
 
 	return resolved, nil
+}
+
+// withOpenClawGatewayTokenEnv injects OpenClaw gateway token environment so the
+// in-pod agent talks to its sidecar/desktop with the same credential the
+// initContainer wrote into openclaw.json (csotai customization: 026e4f1+63d4ba5).
+func withOpenClawGatewayTokenEnv(instance *models.Instance, env map[string]string) map[string]string {
+	if instance == nil || !strings.EqualFold(strings.TrimSpace(instance.Type), "openclaw") {
+		return env
+	}
+	if instance.AccessToken == nil || strings.TrimSpace(*instance.AccessToken) == "" {
+		return env
+	}
+
+	token := strings.TrimSpace(*instance.AccessToken)
+	merged := mergeEnvMaps(env, map[string]string{
+		"OPENCLAW_GATEWAY_TOKEN":              token,
+		"OPENCLAW_CONFIG_PATH":                "/config/.openclaw/openclaw.json",
+		"OPENCLAW_AGENT_OPENCLAW_COMMAND":     "openclaw gateway run --auth token --token " + token,
+		"OPENCLAW_AGENT_OPENCLAW_CONFIG_PATH": "/config/.openclaw/openclaw.json",
+	})
+	return merged
 }

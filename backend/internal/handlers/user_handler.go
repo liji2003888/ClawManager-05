@@ -4,7 +4,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -57,7 +56,7 @@ type UpdateQuotaRequest struct {
 
 // CreateUserRequest represents a create user request (admin only)
 type CreateUserRequest struct {
-	Username string `json:"username" binding:"required,min=3,max=32,alphanum"`
+	Username string `json:"username" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 	Password string `json:"password" binding:"omitempty,min=8"`
 	Role     string `json:"role" binding:"required,oneof=admin user"`
@@ -80,8 +79,6 @@ type importedUserCredential struct {
 	MaxGPUCount     int    `json:"max_gpu_count"`
 	InitialPassword string `json:"initial_password"`
 }
-
-var importUsernamePattern = regexp.MustCompile(`^[a-zA-Z0-9]+$`)
 
 // ListUsers lists all users (admin only)
 func (h *UserHandler) ListUsers(c *gin.Context) {
@@ -325,11 +322,8 @@ func importFieldValue(fields []string, headerMap map[string]int, key string) str
 }
 
 func validateImportedUser(username, email, password, role string) string {
-	if len(username) < 3 || len(username) > 32 {
-		return "Username must be between 3 and 32 characters"
-	}
-	if !importUsernamePattern.MatchString(username) {
-		return "Username must be alphanumeric"
+	if username == "" {
+		return "Username is required"
 	}
 	if email == "" || !strings.Contains(email, "@") {
 		return "Email must be a valid email"

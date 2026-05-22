@@ -36,6 +36,7 @@ type SaveLLMModelRequest struct {
 	ProviderModelName string
 	APIKey            *string
 	APIKeySecretRef   *string
+	CustomHeaders     *[]models.LLMModelCustomHeader
 	IsSecure          bool
 	IsActive          bool
 	InputPrice        float64
@@ -65,6 +66,20 @@ type llmModelService struct {
 }
 
 var versionSegmentPattern = regexp.MustCompile(`(?i)^v\d+(?:[a-z0-9._-]*)?$`)
+var httpHeaderNamePattern = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+var disallowedCustomHeaderNames = map[string]struct{}{
+	"connection":          {},
+	"content-length":      {},
+	"host":                {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+}
 
 // NewLLMModelService creates a new LLM model service.
 func NewLLMModelService(repo repository.LLMModelRepository) LLMModelService {
@@ -174,6 +189,16 @@ func (s *llmModelService) SaveModel(req SaveLLMModelRequest) (*models.LLMModel, 
 		}
 	}
 
+	customHeadersJSON := (*string)(nil)
+	if req.CustomHeaders != nil {
+		customHeadersJSON, err = normalizeLLMModelCustomHeaders(*req.CustomHeaders)
+		if err != nil {
+			return nil, err
+		}
+	} else if current != nil {
+		customHeadersJSON = current.CustomHeadersJSON
+	}
+
 	model := &models.LLMModel{
 		ID:                req.ID,
 		DisplayName:       displayName,
@@ -184,6 +209,7 @@ func (s *llmModelService) SaveModel(req SaveLLMModelRequest) (*models.LLMModel, 
 		ProviderModelName: providerModelName,
 		APIKey:            apiKey,
 		APIKeySecretRef:   apiKeySecretRef,
+		CustomHeadersJSON: customHeadersJSON,
 		IsSecure:          req.IsSecure,
 		IsActive:          req.IsActive,
 		InputPrice:        req.InputPrice,
@@ -200,6 +226,59 @@ func (s *llmModelService) SaveModel(req SaveLLMModelRequest) (*models.LLMModel, 
 	}
 
 	return model, nil
+}
+
+func normalizeLLMModelCustomHeaders(items []models.LLMModelCustomHeader) (*string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	normalized := make([]models.LLMModelCustomHeader, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		key := strings.TrimSpace(item.Key)
+		value := strings.TrimSpace(item.Value)
+		if key == "" && value == "" {
+			continue
+		}
+		if key == "" {
+			return nil, errors.New("custom header key is required")
+		}
+		if value == "" {
+			return nil, errors.New("custom header value is required")
+		}
+		if strings.ContainsAny(key, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return nil, errors.New("custom header key and value cannot contain newlines")
+		}
+		if !httpHeaderNamePattern.MatchString(key) {
+			return nil, fmt.Errorf("custom header key is invalid: %s", key)
+		}
+
+		normalizedKey := http.CanonicalHeaderKey(key)
+		lowerKey := strings.ToLower(normalizedKey)
+		if _, blocked := disallowedCustomHeaderNames[lowerKey]; blocked {
+			return nil, fmt.Errorf("custom header key is not allowed: %s", normalizedKey)
+		}
+		if _, exists := seen[lowerKey]; exists {
+			return nil, fmt.Errorf("custom header key is duplicated: %s", normalizedKey)
+		}
+		seen[lowerKey] = struct{}{}
+		normalized = append(normalized, models.LLMModelCustomHeader{
+			Key:   normalizedKey,
+			Value: value,
+		})
+	}
+
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode custom headers: %w", err)
+	}
+	encoded := string(raw)
+	return &encoded, nil
 }
 
 func (s *llmModelService) DeleteModel(id int) error {

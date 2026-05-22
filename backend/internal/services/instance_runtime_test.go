@@ -5,18 +5,18 @@ import "testing"
 func TestDefaultImagePullPolicy_Default(t *testing.T) {
 	t.Setenv("IMAGE_PULL_POLICY", "")
 	got := defaultImagePullPolicy()
-	if got != "IfNotPresent" {
-		t.Fatalf("expected IfNotPresent, got %q", got)
+	if got != "Always" {
+		t.Fatalf("expected Always, got %q", got)
 	}
 }
 
-func TestDefaultImagePullPolicy_IgnoresEnvOverride(t *testing.T) {
-	for _, envValue := range []string{"Always", "Never", "IfNotPresent", "   "} {
+func TestDefaultImagePullPolicy_HonoursEnvOverride(t *testing.T) {
+	for _, envValue := range []string{"Always", "Never", "IfNotPresent"} {
 		t.Run(envValue, func(t *testing.T) {
 			t.Setenv("IMAGE_PULL_POLICY", envValue)
 			got := defaultImagePullPolicy()
-			if got != "IfNotPresent" {
-				t.Fatalf("expected IfNotPresent, got %q", got)
+			if got != envValue {
+				t.Fatalf("expected %q, got %q", envValue, got)
 			}
 		})
 	}
