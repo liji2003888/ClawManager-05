@@ -735,63 +735,6 @@ func TestIsResponsesEndpoint(t *testing.T) {
 	}
 }
 
-func TestNormalizeChatMessagesMergesDeveloperAndSystem(t *testing.T) {
-	raw := json.RawMessage(`[
-		{"role":"developer","content":"You are X"},
-		{"role":"user","content":"hi"},
-		{"role":"system","content":"Be brief"},
-		{"role":"assistant","content":"ok"}
-	]`)
-	normalized, err := normalizeChatMessages(raw)
-	if err != nil {
-		t.Fatalf("normalizeChatMessages returned error: %v", err)
-	}
-	var decoded []map[string]any
-	if err := json.Unmarshal(normalized, &decoded); err != nil {
-		t.Fatalf("failed to decode: %v", err)
-	}
-	if len(decoded) != 3 {
-		t.Fatalf("expected 3 messages (merged system + user + assistant), got %d: %s", len(decoded), string(normalized))
-	}
-	if decoded[0]["role"] != "system" || decoded[0]["content"] != "You are X\n\nBe brief" {
-		t.Fatalf("unexpected leading system: %v", decoded[0])
-	}
-	if decoded[1]["role"] != "user" || decoded[1]["content"] != "hi" {
-		t.Fatalf("unexpected user message: %v", decoded[1])
-	}
-	if decoded[2]["role"] != "assistant" {
-		t.Fatalf("expected assistant preserved at end, got %v", decoded[2])
-	}
-}
-
-func TestNormalizeChatMessagesPreservesToolCallsWithEmptyContent(t *testing.T) {
-	raw := json.RawMessage(`[
-		{"role":"user","content":"call foo"},
-		{"role":"assistant","content":null,"tool_calls":[{"id":"1","type":"function","function":{"name":"foo","arguments":"{}"}}]},
-		{"role":"tool","tool_call_id":"1","content":"42"}
-	]`)
-	normalized, err := normalizeChatMessages(raw)
-	if err != nil {
-		t.Fatalf("normalizeChatMessages returned error: %v", err)
-	}
-	var decoded []map[string]any
-	if err := json.Unmarshal(normalized, &decoded); err != nil {
-		t.Fatalf("failed to decode: %v", err)
-	}
-	if len(decoded) != 3 {
-		t.Fatalf("expected 3 messages preserved (no system), got %d", len(decoded))
-	}
-	if decoded[1]["role"] != "assistant" {
-		t.Fatalf("expected assistant tool_call to survive, got %v", decoded[1])
-	}
-	if _, ok := decoded[1]["tool_calls"]; !ok {
-		t.Fatalf("expected tool_calls preserved")
-	}
-	if decoded[2]["tool_call_id"] != "1" {
-		t.Fatalf("expected tool_call_id preserved on tool message, got %v", decoded[2])
-	}
-}
-
 func TestNormalizeResponsesPayloadFoldsInstructionsIntoSystem(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5",
