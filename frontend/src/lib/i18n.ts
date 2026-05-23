@@ -1353,6 +1353,9 @@ export const translations: Record<Locale, TranslationTree> = {
         "Each custom header needs both a key and a value.",
       saveFailed: "Failed to save model",
       deleteFailed: "Failed to delete model",
+      confirmDeleteTitle: "Delete model?",
+      confirmDeleteMessage:
+        "Are you sure you want to delete the model \"{name}\"? This action cannot be undone.",
       secure: "Secure",
       secureModel: "Secure model",
       active: "Active",
@@ -2590,6 +2593,8 @@ export const translations: Record<Locale, TranslationTree> = {
       customHeadersRequired: "每个自定义 Header 都需要同时填写 key 和 value。",
       saveFailed: "保存模型失败",
       deleteFailed: "删除模型失败",
+      confirmDeleteTitle: "确认删除模型？",
+      confirmDeleteMessage: "确定要删除模型 \"{name}\" 吗？该操作不可恢复。",
       secure: "安全",
       secureModel: "安全模型",
       active: "启用",
@@ -3783,6 +3788,9 @@ export const translations: Record<Locale, TranslationTree> = {
         "各カスタム Header には key と value の両方が必要です。",
       saveFailed: "モデルの保存に失敗しました",
       deleteFailed: "モデルの削除に失敗しました",
+      confirmDeleteTitle: "モデルを削除しますか？",
+      confirmDeleteMessage:
+        "モデル \"{name}\" を本当に削除しますか？この操作は元に戻せません。",
       secure: "安全",
       secureModel: "安全モデル",
       active: "有効",
@@ -5043,6 +5051,9 @@ export const translations: Record<Locale, TranslationTree> = {
         "각 사용자 지정 Header에는 key와 value가 모두 필요합니다.",
       saveFailed: "모델 저장에 실패했습니다",
       deleteFailed: "모델 삭제에 실패했습니다",
+      confirmDeleteTitle: "모델을 삭제하시겠습니까?",
+      confirmDeleteMessage:
+        "모델 \"{name}\" 을(를) 정말로 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
       secure: "보안",
       secureModel: "보안 모델",
       active: "활성",
@@ -6291,6 +6302,9 @@ export const translations: Record<Locale, TranslationTree> = {
         "Jeder benutzerdefinierte Header benötigt sowohl Key als auch Value.",
       saveFailed: "Modell konnte nicht gespeichert werden",
       deleteFailed: "Modell konnte nicht gelöscht werden",
+      confirmDeleteTitle: "Modell löschen?",
+      confirmDeleteMessage:
+        "Möchten Sie das Modell \"{name}\" wirklich löschen? Diese Aktion kann nicht rückgängig gemacht werden.",
       secure: "Sicher",
       secureModel: "Sicheres Modell",
       active: "Aktiv",

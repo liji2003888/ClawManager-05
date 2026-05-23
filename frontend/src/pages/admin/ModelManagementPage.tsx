@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import AdminLayout from '../../components/AdminLayout';
+import ConfirmDialog from '../../components/ConfirmDialog';
 import {
   modelService,
   type DiscoveredProviderModel,
@@ -504,9 +505,14 @@ const ModelManagementPage: React.FC = () => {
   const [models, setModels] = useState<EditableModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
+  const [pendingDeleteLocalId, setPendingDeleteLocalId] = useState<string | null>(null);
   const discoveryTimersRef = useRef<Record<string, number>>({});
   const newCardRef = useRef<HTMLDivElement | null>(null);
   const editingCard = models.find((item) => item.isEditing);
+  const pendingDeleteCard =
+    pendingDeleteLocalId !== null
+      ? models.find((item) => item.local_id === pendingDeleteLocalId)
+      : undefined;
   const hasEditingCard = Boolean(editingCard);
 
   useEffect(() => {
@@ -800,9 +806,26 @@ const ModelManagementPage: React.FC = () => {
     }
   };
 
-  const deleteCard = async (card: EditableModel) => {
+  const requestDelete = (card: EditableModel) => {
+    // Unsaved new draft has no server-side id — drop locally without prompt.
     if (!card.id) {
       setModels((current) => current.filter((item) => item.local_id !== card.local_id));
+      return;
+    }
+    setPendingDeleteLocalId(card.local_id);
+  };
+
+  const cancelDelete = () => {
+    if (pendingDeleteCard?.saving) {
+      return;
+    }
+    setPendingDeleteLocalId(null);
+  };
+
+  const confirmDelete = async () => {
+    const card = pendingDeleteCard;
+    if (!card || !card.id) {
+      setPendingDeleteLocalId(null);
       return;
     }
 
@@ -810,11 +833,13 @@ const ModelManagementPage: React.FC = () => {
     try {
       await modelService.deleteModel(card.id);
       setModels((current) => current.filter((item) => item.local_id !== card.local_id));
+      setPendingDeleteLocalId(null);
     } catch (error: any) {
       updateCard(card.local_id, {
         saving: false,
         error: error.response?.data?.error || t('modelManagementPage.deleteFailed'),
       });
+      setPendingDeleteLocalId(null);
     }
   };
 
@@ -956,7 +981,7 @@ const ModelManagementPage: React.FC = () => {
                       <div className="mt-5 flex items-center justify-end gap-3">
                         <button
                           type="button"
-                          onClick={() => deleteCard(card)}
+                          onClick={() => requestDelete(card)}
                           disabled={card.saving}
                           className="app-button-secondary disabled:cursor-not-allowed disabled:opacity-50"
                         >
@@ -1279,7 +1304,7 @@ const ModelManagementPage: React.FC = () => {
                         </button>
                         <button
                           type="button"
-                          onClick={() => deleteCard(card)}
+                          onClick={() => requestDelete(card)}
                           disabled={card.saving}
                           className="app-button-secondary disabled:cursor-not-allowed disabled:opacity-50"
                         >
@@ -1309,6 +1334,19 @@ const ModelManagementPage: React.FC = () => {
         </section>
 
       </div>
+      <ConfirmDialog
+        open={pendingDeleteCard !== undefined}
+        title={t('modelManagementPage.confirmDeleteTitle')}
+        message={t('modelManagementPage.confirmDeleteMessage', {
+          name: pendingDeleteCard?.display_name ?? '',
+        })}
+        confirmLabel={t('common.delete')}
+        cancelLabel={t('common.cancel')}
+        destructive
+        loading={pendingDeleteCard?.saving === true}
+        onCancel={cancelDelete}
+        onConfirm={() => void confirmDelete()}
+      />
     </AdminLayout>
   );
 };
