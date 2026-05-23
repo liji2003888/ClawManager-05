@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -2802,6 +2803,11 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 		return nil, model, err
 	}
 
+	if passthroughDebugEnabled() {
+		log.Printf("ai gateway passthrough: POST %s model=%s body=%s",
+			endpoint, model.DisplayName, summarizeForLog(rewrittenBody, 4096))
+	}
+
 	client := s.passthroughClient
 	if client == nil {
 		client = s.httpClient
@@ -2810,7 +2816,34 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	if err != nil {
 		return nil, model, fmt.Errorf("provider call failed: %w", err)
 	}
+
+	if passthroughDebugEnabled() && response.StatusCode >= 400 {
+		bodyBytes, peekErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if peekErr == nil {
+			log.Printf("ai gateway passthrough: upstream %d for %s (model=%s): %s",
+				response.StatusCode, endpoint, model.DisplayName, summarizeForLog(bodyBytes, 4096))
+		}
+		response.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
 	return response, model, nil
+}
+
+func passthroughDebugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GATEWAY_PASSTHROUGH_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func summarizeForLog(data []byte, max int) string {
+	if len(data) <= max {
+		return string(data)
+	}
+	return string(data[:max]) + fmt.Sprintf("...(truncated, %d bytes total)", len(data))
 }
 
 // rewritePassthroughBody decodes a passthrough body, swaps the `model` field

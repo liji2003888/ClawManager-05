@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"clawreef/internal/aigateway"
 	"clawreef/internal/utils"
@@ -23,6 +24,12 @@ func NewAIGatewayHandler(service aigateway.Service) *AIGatewayHandler {
 }
 
 // ListModels returns active models available to the current user.
+//
+// The response includes both the ClawManager-native `items` array and an
+// OpenAI-compatible `data` array (object: "list") so that OpenAI-style
+// clients (codex CLI, OpenAI SDK) can parse the same endpoint. A synthetic
+// "auto" entry is included in `data` so clients that look up metadata for
+// model="auto" do not fail open.
 func (h *AIGatewayHandler) ListModels(c *gin.Context) {
 	items, err := h.service.ListAvailableModels()
 	if err != nil {
@@ -30,8 +37,29 @@ func (h *AIGatewayHandler) ListModels(c *gin.Context) {
 		return
 	}
 
+	now := time.Now().Unix()
+	openAIData := make([]gin.H, 0, len(items)+1)
+	// Synthetic "auto" entry first so clients that probe by id find it
+	// regardless of how many real models are configured.
+	openAIData = append(openAIData, gin.H{
+		"id":       "auto",
+		"object":   "model",
+		"created":  now,
+		"owned_by": "clawmanager",
+	})
+	for _, item := range items {
+		openAIData = append(openAIData, gin.H{
+			"id":       item.DisplayName,
+			"object":   "model",
+			"created":  now,
+			"owned_by": item.Provider,
+		})
+	}
+
 	utils.Success(c, http.StatusOK, "Available gateway models retrieved successfully", gin.H{
-		"items": items,
+		"items":  items,
+		"object": "list",
+		"data":   openAIData,
 	})
 }
 
