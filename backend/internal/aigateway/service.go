@@ -51,6 +51,18 @@ type ChatMessage struct {
 	Audio      interface{} `json:"audio,omitempty"`
 }
 
+// PassthroughRequest captures the minimal context needed to proxy an
+// OpenAI-compatible request to an upstream provider without parsing the body.
+type PassthroughRequest struct {
+	Model      string
+	RawBody    []byte
+	InstanceID *int
+	SubPath    string // e.g. "/responses" — appended to model.BaseURL
+	Stream     bool
+	TraceID    string
+	RequestID  string
+}
+
 // ChatCompletionRequest is the platform gateway request shape.
 type ChatCompletionRequest struct {
 	RawBody           []byte          `json:"-"`
@@ -277,6 +289,11 @@ type Service interface {
 	ListAvailableModels() ([]AvailableModel, error)
 	ChatCompletions(ctx context.Context, userID int, req ChatCompletionRequest) (*ProxyResponse, string, error)
 	StreamChatCompletions(ctx context.Context, userID int, req ChatCompletionRequest, w http.ResponseWriter) (string, error)
+	// Passthrough proxies an unrecognized OpenAI-compatible POST (e.g. /responses)
+	// directly to the upstream provider. Risk detection, audit logging, and cost
+	// accounting are intentionally skipped — use only for protocols ClawManager
+	// does not natively understand.
+	Passthrough(ctx context.Context, userID int, req PassthroughRequest) (*http.Response, *models.LLMModel, error)
 }
 
 type service struct {
@@ -291,6 +308,7 @@ type service struct {
 	chatMessageService services.ChatMessageService
 	secretRefService   services.SecretRefService
 	httpClient         *http.Client
+	passthroughClient  *http.Client
 }
 
 // NewService creates a new AI gateway service.
@@ -318,6 +336,12 @@ func NewService(
 		secretRefService:   services.NewSecretRefService(),
 		httpClient: &http.Client{
 			Timeout: 90 * time.Second,
+		},
+		passthroughClient: &http.Client{
+			// Reasoning models / Responses API streams can run for minutes.
+			// Rely on the request context for cancellation instead of a hard
+			// client-side timeout.
+			Timeout: 0,
 		},
 	}
 }
@@ -2682,4 +2706,100 @@ func extractAssistantContent(response ChatCompletionResponse) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// Passthrough proxies an arbitrary OpenAI-compatible POST (e.g. /responses)
+// directly to the upstream provider configured for the requested model.
+// Risk detection, audit, and cost accounting are intentionally skipped.
+//
+// Caller MUST close the returned http.Response.Body. For streaming requests,
+// caller is responsible for incrementally reading + flushing to the client.
+func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRequest) (*http.Response, *models.LLMModel, error) {
+	model, err := s.resolveRequestedModel(strings.TrimSpace(req.Model))
+	if err != nil {
+		return nil, nil, err
+	}
+	if model == nil {
+		return nil, nil, errors.New("model is not active or does not exist")
+	}
+	if req.InstanceID != nil && s.instanceRepo != nil {
+		instance, err := s.instanceRepo.GetByID(*req.InstanceID)
+		if err != nil {
+			return nil, model, fmt.Errorf("failed to get instance: %w", err)
+		}
+		if instance == nil {
+			return nil, model, errors.New("instance not found")
+		}
+		if instance.UserID != userID {
+			return nil, model, errors.New("access denied")
+		}
+	}
+
+	resolvedAPIKey, err := s.secretRefService.ResolveString(ctx, model.APIKey, model.APIKeySecretRef)
+	if err != nil {
+		return nil, model, err
+	}
+
+	subPath := strings.TrimSpace(req.SubPath)
+	if subPath == "" {
+		return nil, model, errors.New("passthrough sub path is required")
+	}
+	if !strings.HasPrefix(subPath, "/") {
+		subPath = "/" + subPath
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(model.BaseURL), "/") + subPath
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(req.RawBody))
+	if err != nil {
+		return nil, model, fmt.Errorf("failed to build provider request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if req.Stream {
+		httpReq.Header.Set("Accept", "text/event-stream")
+	} else {
+		httpReq.Header.Set("Accept", "application/json")
+	}
+	if req.TraceID != "" {
+		httpReq.Header.Set("X-Trace-ID", req.TraceID)
+	}
+	if req.RequestID != "" {
+		httpReq.Header.Set("X-Request-ID", req.RequestID)
+	}
+	if resolvedAPIKey != nil && strings.TrimSpace(*resolvedAPIKey) != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*resolvedAPIKey))
+	}
+
+	// Apply per-model custom headers (preserving csotai customization), with a
+	// minimal variable set since we do not parse the request body.
+	variables := map[string]string{}
+	addHeaderVariable(variables, "user.id", strconv.Itoa(userID))
+	addHeaderVariable(variables, "user_id", strconv.Itoa(userID))
+	if req.TraceID != "" {
+		addHeaderVariable(variables, "request.trace_id", req.TraceID)
+		addHeaderVariable(variables, "trace_id", req.TraceID)
+	}
+	if req.RequestID != "" {
+		addHeaderVariable(variables, "request.request_id", req.RequestID)
+		addHeaderVariable(variables, "request_id", req.RequestID)
+	}
+	if req.InstanceID != nil {
+		addHeaderVariable(variables, "instance.id", strconv.Itoa(*req.InstanceID))
+		addHeaderVariable(variables, "instance_id", strconv.Itoa(*req.InstanceID))
+	}
+	addHeaderVariable(variables, "model.id", strconv.Itoa(model.ID))
+	addHeaderVariable(variables, "model.display_name", model.DisplayName)
+	addHeaderVariable(variables, "model.provider_model_name", model.ProviderModelName)
+	if err := applyCustomProviderHeaders(httpReq, model, variables); err != nil {
+		return nil, model, err
+	}
+
+	client := s.passthroughClient
+	if client == nil {
+		client = s.httpClient
+	}
+	response, err := client.Do(httpReq)
+	if err != nil {
+		return nil, model, fmt.Errorf("provider call failed: %w", err)
+	}
+	return response, model, nil
 }

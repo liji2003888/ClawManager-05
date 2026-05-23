@@ -363,6 +363,8 @@ func main() {
 		{
 			gatewayLLM.GET("/models", aiGatewayHandler.ListModels)
 			gatewayLLM.POST("/chat/completions", aiGatewayHandler.ChatCompletions)
+			// OpenAI Responses API passthrough (no risk/audit/cost — body not parsed).
+			gatewayLLM.POST("/responses", aiGatewayHandler.Responses)
 		}
 
 		agent := api.Group("/agent")
