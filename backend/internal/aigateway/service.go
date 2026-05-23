@@ -2787,11 +2787,25 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	} else {
 		httpReq.Header.Set("Accept", "application/json")
 	}
-	if req.TraceID != "" {
-		httpReq.Header.Set("X-Trace-ID", req.TraceID)
+	// Always emit X-Trace-ID / X-Request-ID for upstream correlation,
+	// generating one when the caller did not supply it (same behavior as
+	// /chat/completions). X-User-ID surfaces the ClawManager user that
+	// owns the request so upstream gateways can audit per-user usage.
+	traceID := strings.TrimSpace(req.TraceID)
+	if traceID == "" {
+		traceID = normalizeOrCreateID(nil, "trc")
 	}
-	if req.RequestID != "" {
-		httpReq.Header.Set("X-Request-ID", req.RequestID)
+	requestID := strings.TrimSpace(req.RequestID)
+	if requestID == "" {
+		requestID = normalizeOrCreateID(nil, "req")
+	}
+	req.TraceID = traceID
+	req.RequestID = requestID
+	httpReq.Header.Set("X-Trace-ID", traceID)
+	httpReq.Header.Set("X-Request-ID", requestID)
+	httpReq.Header.Set("X-User-ID", strconv.Itoa(userID))
+	if req.InstanceID != nil {
+		httpReq.Header.Set("X-Instance-ID", strconv.Itoa(*req.InstanceID))
 	}
 	if resolvedAPIKey != nil && strings.TrimSpace(*resolvedAPIKey) != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*resolvedAPIKey))
