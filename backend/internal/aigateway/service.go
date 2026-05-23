@@ -2723,17 +2723,19 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	if model == nil {
 		return nil, nil, errors.New("model is not active or does not exist")
 	}
+	var instance *models.Instance
 	if req.InstanceID != nil && s.instanceRepo != nil {
-		instance, err := s.instanceRepo.GetByID(*req.InstanceID)
+		fetched, err := s.instanceRepo.GetByID(*req.InstanceID)
 		if err != nil {
 			return nil, model, fmt.Errorf("failed to get instance: %w", err)
 		}
-		if instance == nil {
+		if fetched == nil {
 			return nil, model, errors.New("instance not found")
 		}
-		if instance.UserID != userID {
+		if fetched.UserID != userID {
 			return nil, model, errors.New("access denied")
 		}
+		instance = fetched
 	}
 
 	resolvedAPIKey, err := s.secretRefService.ResolveString(ctx, model.APIKey, model.APIKeySecretRef)
@@ -2803,34 +2805,56 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	req.RequestID = requestID
 	httpReq.Header.Set("X-Trace-ID", traceID)
 	httpReq.Header.Set("X-Request-ID", requestID)
-	httpReq.Header.Set("X-User-ID", strconv.Itoa(userID))
-	if req.InstanceID != nil {
-		httpReq.Header.Set("X-Instance-ID", strconv.Itoa(*req.InstanceID))
-	}
 	if resolvedAPIKey != nil && strings.TrimSpace(*resolvedAPIKey) != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(*resolvedAPIKey))
 	}
 
-	// Apply per-model custom headers (preserving csotai customization), with a
-	// minimal variable set since we do not parse the request body.
+	// Apply per-model custom headers, mirroring the variable set
+	// /chat/completions exposes via preparedChatRequest.customHeaderVariables
+	// so the same templates (e.g. "X-User-ID: {{instance.name}}") render
+	// identically on both paths.
 	variables := map[string]string{}
 	addHeaderVariable(variables, "user.id", strconv.Itoa(userID))
 	addHeaderVariable(variables, "user_id", strconv.Itoa(userID))
-	if req.TraceID != "" {
-		addHeaderVariable(variables, "request.trace_id", req.TraceID)
-		addHeaderVariable(variables, "trace_id", req.TraceID)
-	}
-	if req.RequestID != "" {
-		addHeaderVariable(variables, "request.request_id", req.RequestID)
-		addHeaderVariable(variables, "request_id", req.RequestID)
-	}
-	if req.InstanceID != nil {
-		addHeaderVariable(variables, "instance.id", strconv.Itoa(*req.InstanceID))
-		addHeaderVariable(variables, "instance_id", strconv.Itoa(*req.InstanceID))
-	}
+	addHeaderVariable(variables, "clawmanager.user_id", strconv.Itoa(userID))
+	addHeaderVariable(variables, "CLAWMANAGER_USER_ID", strconv.Itoa(userID))
+	addHeaderVariable(variables, "request.trace_id", traceID)
+	addHeaderVariable(variables, "trace_id", traceID)
+	addHeaderVariable(variables, "clawmanager.trace_id", traceID)
+	addHeaderVariable(variables, "CLAWMANAGER_TRACE_ID", traceID)
+	addHeaderVariable(variables, "request.request_id", requestID)
+	addHeaderVariable(variables, "request_id", requestID)
+	addHeaderVariable(variables, "clawmanager.request_id", requestID)
+	addHeaderVariable(variables, "CLAWMANAGER_REQUEST_ID", requestID)
 	addHeaderVariable(variables, "model.id", strconv.Itoa(model.ID))
 	addHeaderVariable(variables, "model.display_name", model.DisplayName)
+	addHeaderVariable(variables, "model.provider_type", model.ProviderType)
+	addHeaderVariable(variables, "model.protocol_type", model.ProtocolType)
 	addHeaderVariable(variables, "model.provider_model_name", model.ProviderModelName)
+	addHeaderVariable(variables, "provider_model_name", model.ProviderModelName)
+	addHeaderVariable(variables, "CLAWMANAGER_MODEL", model.DisplayName)
+	addHeaderVariable(variables, "CLAWMANAGER_PROVIDER_MODEL", model.ProviderModelName)
+
+	instanceID := 0
+	if req.InstanceID != nil {
+		instanceID = *req.InstanceID
+	}
+	if instance != nil {
+		instanceID = instance.ID
+	}
+	if instanceID > 0 {
+		instanceIDText := strconv.Itoa(instanceID)
+		addHeaderVariable(variables, "instance.id", instanceIDText)
+		addHeaderVariable(variables, "instance_id", instanceIDText)
+		addHeaderVariable(variables, "openclaw.instance_id", instanceIDText)
+		addHeaderVariable(variables, "clawmanager.instance_id", instanceIDText)
+		addHeaderVariable(variables, "OPENCLAW_INSTANCE_ID", instanceIDText)
+		addHeaderVariable(variables, "CLAWMANAGER_INSTANCE_ID", instanceIDText)
+	}
+	if instance != nil {
+		addInstanceHeaderVariables(variables, instance)
+	}
+
 	if err := applyCustomProviderHeaders(httpReq, model, variables); err != nil {
 		return nil, model, err
 	}
