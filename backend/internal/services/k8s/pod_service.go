@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -64,11 +65,24 @@ type PodConfig struct {
 	SHMSizeGB            int
 	SecurityMode         PodSecurityMode
 	// OpenClaw cross-cluster sidecar / bootstrap (csotai customization)
-	SidecarEnabled       bool
-	SidecarImage         string
-	InitContainerEnabled bool
-	InitContainerImage   string
-	InitContainerToken   string
+	SidecarEnabled         bool
+	SidecarImage           string
+	InitContainerEnabled   bool
+	InitContainerImage     string
+	InitContainerToken     string
+	// InitContainerMountPath is where the init container mounts the data PVC.
+	// Defaults to "/config" (OpenClaw layout). For Hermes use "/config/.hermes"
+	// so the init container writes into the same subtree the main container
+	// mounts.
+	InitContainerMountPath string
+	// InitContainerScript, when non-empty, is passed as /bin/sh -c args to the
+	// init container. When empty, the container's own ENTRYPOINT/CMD runs —
+	// useful for Hermes-style images that ship their own bootstrap logic.
+	InitContainerScript    string
+	// InitContainerExtraEnv lets callers add image-specific env vars (e.g.
+	// CLAWMANAGER_HERMES_BOOTSTRAP_MANIFEST_JSON) without touching this
+	// package.
+	InitContainerExtraEnv  map[string]string
 }
 
 type PVCMount struct {
@@ -328,68 +342,23 @@ func (s *PodService) CreatePod(ctx context.Context, config PodConfig) (*corev1.P
 		})
 	}
 
-	// Add init container for openclaw instances (csotai customization)
+	// Add bootstrap init container for managed-runtime instances. OpenClaw uses
+	// the inline OpenClaw seed script; Hermes (and any other image with its own
+	// ENTRYPOINT) leaves InitContainerScript empty so the image's own
+	// bootstrap logic runs. (csotai customization, extended for Hermes)
 	if config.InitContainerEnabled && config.InitContainerImage != "" {
+		mountPath := strings.TrimSpace(config.InitContainerMountPath)
+		if mountPath == "" {
+			mountPath = "/config"
+		}
 		initContainer := corev1.Container{
 			Name:            "bootstrap",
 			Image:           config.InitContainerImage,
 			ImagePullPolicy: corev1.PullAlways,
-			Command:         []string{"/bin/sh", "-c"},
-			Args: []string{`set -eu
-
-OPENCLAW_DIR="/config/.openclaw"
-OPENCLAW_CONFIG="${OPENCLAW_DIR}/openclaw.json"
-SENTINEL="/config/.bootstrap-v1.done"
-
-mkdir -p "$OPENCLAW_DIR" /config/workspace /config/skills /config/scripts
-
-if [ ! -f "$SENTINEL" ]; then
-  if [ -d /seed/workspace ]; then
-    cp -R /seed/workspace/. /config/workspace/
-  fi
-
-  if [ -d /seed/skills ]; then
-    cp -R /seed/skills/. /config/skills/
-  fi
-
-  if [ -d /seed/scripts ]; then
-    cp -R /seed/scripts/. /config/scripts/
-  fi
-fi
-
-if [ ! -f "$OPENCLAW_CONFIG" ]; then
-  TOKEN_ESCAPED="$(printf '%s' "$OPENCLAW_BOOTSTRAP_TOKEN" | sed 's/[\\/&]/\\\\&/g')"
-  sed "s/__GATEWAY_TOKEN__/${TOKEN_ESCAPED}/g" /seed/openclaw.json.tpl > "$OPENCLAW_CONFIG"
-fi
-
-if command -v node >/dev/null 2>&1; then
-  OPENCLAW_CONFIG_TOKEN="$OPENCLAW_BOOTSTRAP_TOKEN" OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG" node <<'NODE'
-const fs = require('fs');
-
-const configPath = process.env.OPENCLAW_CONFIG_PATH;
-const raw = fs.readFileSync(configPath, 'utf8').trim();
-const config = raw ? JSON.parse(raw) : {};
-if (!config.gateway || typeof config.gateway !== 'object' || Array.isArray(config.gateway)) {
-  config.gateway = {};
-}
-if (!config.gateway.auth || typeof config.gateway.auth !== 'object' || Array.isArray(config.gateway.auth)) {
-  config.gateway.auth = {};
-}
-config.gateway.auth.mode = 'token';
-config.gateway.auth.token = process.env.OPENCLAW_CONFIG_TOKEN;
-fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
-NODE
-else
-  echo "node is required to configure gateway.auth.token" >&2
-  exit 1
-fi
-
-chmod 600 "$OPENCLAW_CONFIG" || true
-touch "$SENTINEL"`},
 			VolumeMounts: []corev1.VolumeMount{
 				{
 					Name:      "data",
-					MountPath: "/config",
+					MountPath: mountPath,
 				},
 			},
 			Env: []corev1.EnvVar{
@@ -397,7 +366,37 @@ touch "$SENTINEL"`},
 					Name:  "OPENCLAW_BOOTSTRAP_TOKEN",
 					Value: config.InitContainerToken,
 				},
+				{
+					Name:  "BOOTSTRAP_TOKEN",
+					Value: config.InitContainerToken,
+				},
+				{
+					Name:  "INSTANCE_ID",
+					Value: fmt.Sprintf("%d", config.InstanceID),
+				},
+				{
+					Name:  "USER_ID",
+					Value: fmt.Sprintf("%d", config.UserID),
+				},
+				{
+					Name:  "INSTANCE_TYPE",
+					Value: config.Type,
+				},
+				{
+					Name:  "INSTANCE_MOUNT_PATH",
+					Value: mountPath,
+				},
 			},
+		}
+		for key, value := range config.InitContainerExtraEnv {
+			if key == "" {
+				continue
+			}
+			initContainer.Env = append(initContainer.Env, corev1.EnvVar{Name: key, Value: value})
+		}
+		if strings.TrimSpace(config.InitContainerScript) != "" {
+			initContainer.Command = []string{"/bin/sh", "-c"}
+			initContainer.Args = []string{config.InitContainerScript}
 		}
 		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
 	}
@@ -704,3 +703,58 @@ func (s *PodService) waitForPodDeletion(ctx context.Context, namespace, podName 
 		}
 	}
 }
+
+// OpenClawBootstrapScript is the inline shell script the OpenClaw seed init
+// container runs. Hermes images supply their own ENTRYPOINT and leave the
+// PodConfig.InitContainerScript field empty.
+const OpenClawBootstrapScript = `set -eu
+
+OPENCLAW_DIR="/config/.openclaw"
+OPENCLAW_CONFIG="${OPENCLAW_DIR}/openclaw.json"
+SENTINEL="/config/.bootstrap-v1.done"
+
+mkdir -p "$OPENCLAW_DIR" /config/workspace /config/skills /config/scripts
+
+if [ ! -f "$SENTINEL" ]; then
+  if [ -d /seed/workspace ]; then
+    cp -R /seed/workspace/. /config/workspace/
+  fi
+
+  if [ -d /seed/skills ]; then
+    cp -R /seed/skills/. /config/skills/
+  fi
+
+  if [ -d /seed/scripts ]; then
+    cp -R /seed/scripts/. /config/scripts/
+  fi
+fi
+
+if [ ! -f "$OPENCLAW_CONFIG" ]; then
+  TOKEN_ESCAPED="$(printf '%s' "$OPENCLAW_BOOTSTRAP_TOKEN" | sed 's/[\\/&]/\\\\&/g')"
+  sed "s/__GATEWAY_TOKEN__/${TOKEN_ESCAPED}/g" /seed/openclaw.json.tpl > "$OPENCLAW_CONFIG"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  OPENCLAW_CONFIG_TOKEN="$OPENCLAW_BOOTSTRAP_TOKEN" OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG" node <<'NODE'
+const fs = require('fs');
+
+const configPath = process.env.OPENCLAW_CONFIG_PATH;
+const raw = fs.readFileSync(configPath, 'utf8').trim();
+const config = raw ? JSON.parse(raw) : {};
+if (!config.gateway || typeof config.gateway !== 'object' || Array.isArray(config.gateway)) {
+  config.gateway = {};
+}
+if (!config.gateway.auth || typeof config.gateway.auth !== 'object' || Array.isArray(config.gateway.auth)) {
+  config.gateway.auth = {};
+}
+config.gateway.auth.mode = 'token';
+config.gateway.auth.token = process.env.OPENCLAW_CONFIG_TOKEN;
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+NODE
+else
+  echo "node is required to configure gateway.auth.token" >&2
+  exit 1
+fi
+
+chmod 600 "$OPENCLAW_CONFIG" || true
+touch "$SENTINEL"`

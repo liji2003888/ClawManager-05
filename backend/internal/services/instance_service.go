@@ -490,43 +490,45 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 		}
 	}
 
-	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
+	// Prepare sidecar / initContainer for cross-cluster integration (csotai customization)
 	sidecarImage := defaultSidecarImage()
 	enableSidecar := supportsManagedRuntimeIntegration(instance.Type) && sidecarImage != ""
-	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
-	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
 	initContainerToken := ""
 	if instance.AccessToken != nil {
 		initContainerToken = *instance.AccessToken
 	}
+	initImage, initScript, initMountPath := resolveInitContainerSettings(instance.Type, runtimeConfig.MountPath)
+	enableInitContainer := initImage != ""
 
 	podConfig := k8s.PodConfig{
-		InstanceID:           instance.ID,
-		InstanceName:         instance.Name,
-		UserID:               userID,
-		Type:                 instance.Type,
-		RuntimeType:          runtimeType,
-		CPUCores:             instance.CPUCores,
-		MemoryGB:             instance.MemoryGB,
-		GPUEnabled:           instance.GPUEnabled,
-		GPUCount:             instance.GPUCount,
-		Image:                runtimeConfig.Image,
-		MountPath:            runtimeConfig.MountPath,
-		ContainerPort:        runtimeConfig.Port,
-		ImagePullPolicy:      corev1.PullPolicy(defaultImagePullPolicy()),
-		ExtraEnv:             extraEnv,
-		EnvFromSecretNames:   envFromSecretNames,
-		ExtraPVCMounts:       extraPVCMounts,
-		ConfigMapFileMounts:  configMapFileMounts,
-		FSGroup:              fsGroup,
-		VolumeOwnershipFixes: volumeOwnershipFixes,
-		SHMSizeGB:            shmSizeGB,
-		SecurityMode:         s.securityModeForInstance(instance.Type),
-		SidecarEnabled:       enableSidecar,
-		SidecarImage:         sidecarImage,
-		InitContainerEnabled: enableInitContainer,
-		InitContainerImage:   openClawSeedImage,
-		InitContainerToken:   initContainerToken,
+		InstanceID:             instance.ID,
+		InstanceName:           instance.Name,
+		UserID:                 userID,
+		Type:                   instance.Type,
+		RuntimeType:            runtimeType,
+		CPUCores:               instance.CPUCores,
+		MemoryGB:               instance.MemoryGB,
+		GPUEnabled:             instance.GPUEnabled,
+		GPUCount:               instance.GPUCount,
+		Image:                  runtimeConfig.Image,
+		MountPath:              runtimeConfig.MountPath,
+		ContainerPort:          runtimeConfig.Port,
+		ImagePullPolicy:        corev1.PullPolicy(defaultImagePullPolicy()),
+		ExtraEnv:               extraEnv,
+		EnvFromSecretNames:     envFromSecretNames,
+		ExtraPVCMounts:         extraPVCMounts,
+		ConfigMapFileMounts:    configMapFileMounts,
+		FSGroup:                fsGroup,
+		VolumeOwnershipFixes:   volumeOwnershipFixes,
+		SHMSizeGB:              shmSizeGB,
+		SecurityMode:           s.securityModeForInstance(instance.Type),
+		SidecarEnabled:         enableSidecar,
+		SidecarImage:           sidecarImage,
+		InitContainerEnabled:   enableInitContainer,
+		InitContainerImage:     initImage,
+		InitContainerToken:     initContainerToken,
+		InitContainerMountPath: initMountPath,
+		InitContainerScript:    initScript,
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
@@ -691,40 +693,46 @@ func (s *instanceService) Start(instanceID int) error {
 		return fmt.Errorf("failed to delete network policy: %w", err)
 	}
 
-	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
+	// Prepare sidecar / initContainer for cross-cluster integration (csotai customization)
 	sidecarImage := defaultSidecarImage()
 	enableSidecar := supportsManagedRuntimeIntegration(instance.Type) && sidecarImage != ""
-	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
-	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
 	initContainerToken := ""
 	if instance.AccessToken != nil {
 		initContainerToken = *instance.AccessToken
 	}
+	initMountPathHint := strings.TrimSpace(instance.MountPath)
+	if initMountPathHint == "" {
+		initMountPathHint = runtimeConfig.MountPath
+	}
+	initImage, initScript, initMountPath := resolveInitContainerSettings(instance.Type, initMountPathHint)
+	enableInitContainer := initImage != ""
 
 	shmSizeGB := popSHMSizeGB(extraEnv)
 	podConfig := k8s.PodConfig{
-		InstanceID:           instance.ID,
-		InstanceName:         instance.Name,
-		UserID:               instance.UserID,
-		Type:                 instance.Type,
-		RuntimeType:          normalizeInstanceRuntimeType(instance.RuntimeType),
-		CPUCores:             instance.CPUCores,
-		MemoryGB:             instance.MemoryGB,
-		GPUEnabled:           instance.GPUEnabled,
-		GPUCount:             instance.GPUCount,
-		Image:                runtimeConfig.Image,
-		MountPath:            instance.MountPath,
-		ContainerPort:        runtimeConfig.Port,
-		ImagePullPolicy:      corev1.PullPolicy(defaultImagePullPolicy()),
-		ExtraEnv:             extraEnv,
-		EnvFromSecretNames:   []string{bootstrapSecretName},
-		SHMSizeGB:            shmSizeGB,
-		SecurityMode:         s.securityModeForInstance(instance.Type),
-		SidecarEnabled:       enableSidecar,
-		SidecarImage:         sidecarImage,
-		InitContainerEnabled: enableInitContainer,
-		InitContainerImage:   openClawSeedImage,
-		InitContainerToken:   initContainerToken,
+		InstanceID:             instance.ID,
+		InstanceName:           instance.Name,
+		UserID:                 instance.UserID,
+		Type:                   instance.Type,
+		RuntimeType:            normalizeInstanceRuntimeType(instance.RuntimeType),
+		CPUCores:               instance.CPUCores,
+		MemoryGB:               instance.MemoryGB,
+		GPUEnabled:             instance.GPUEnabled,
+		GPUCount:               instance.GPUCount,
+		Image:                  runtimeConfig.Image,
+		MountPath:              instance.MountPath,
+		ContainerPort:          runtimeConfig.Port,
+		ImagePullPolicy:        corev1.PullPolicy(defaultImagePullPolicy()),
+		ExtraEnv:               extraEnv,
+		EnvFromSecretNames:     []string{bootstrapSecretName},
+		SHMSizeGB:              shmSizeGB,
+		SecurityMode:           s.securityModeForInstance(instance.Type),
+		SidecarEnabled:         enableSidecar,
+		SidecarImage:           sidecarImage,
+		InitContainerEnabled:   enableInitContainer,
+		InitContainerImage:     initImage,
+		InitContainerToken:     initContainerToken,
+		InitContainerMountPath: initMountPath,
+		InitContainerScript:    initScript,
 	}
 
 	pod, err := s.podService.CreatePod(ctx, podConfig)
@@ -1412,6 +1420,46 @@ func additionalServicePorts(primaryPort int32) []int32 {
 // + gateway/18789).
 func openClawAdditionalServicePorts() []int32 {
 	return []int32{5001, 18789}
+}
+
+// resolveInitContainerSettings picks the bootstrap init-container image,
+// inline script and PVC mount path for a given instance type.
+//
+//   - OpenClaw: OPENCLAW_SEED_IMAGE + inline OpenClawBootstrapScript +
+//     mount the PVC root at /config (matches the OpenClaw seed layout).
+//   - Hermes: HERMES_SEED_IMAGE + image's own ENTRYPOINT (no inline
+//     script) + mount the PVC at /config/.hermes so the image writes
+//     directly into the subtree the main container reads from.
+//   - Any other type: no init container.
+//
+// Returns (image, script, mountPath). image == "" means the init container is
+// disabled. mountPath defaults to "/config" when no better hint is available.
+func resolveInitContainerSettings(instanceType, mountPathHint string) (string, string, string) {
+	mountPath := strings.TrimSpace(mountPathHint)
+	if mountPath == "" {
+		mountPath = "/config"
+	}
+	switch strings.ToLower(strings.TrimSpace(instanceType)) {
+	case "openclaw":
+		image := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
+		if image == "" {
+			return "", "", ""
+		}
+		// OpenClaw inline script expects to mount PVC root at /config so it
+		// can mkdir /config/.openclaw, /config/workspace, ...
+		return image, k8s.OpenClawBootstrapScript, "/config"
+	case "hermes":
+		image := strings.TrimSpace(os.Getenv("HERMES_SEED_IMAGE"))
+		if image == "" {
+			return "", "", ""
+		}
+		// Hermes image carries its own ENTRYPOINT. Mount the PVC at the same
+		// path the main Hermes container uses so files land where Hermes
+		// expects them.
+		return image, "", mountPath
+	default:
+		return "", "", ""
+	}
 }
 
 func normalizeInstanceRuntimeType(runtimeType string) string {
