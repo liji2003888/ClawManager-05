@@ -2749,6 +2749,18 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	if err != nil {
 		return nil, model, err
 	}
+	// Some downstream LLM gateways (Bifrost + Qwen, vLLM, etc.) reject
+	// OpenAI Responses messages that use the `developer` role or contain
+	// multiple system messages. Normalize the input[] array so they receive
+	// at most one leading system message followed by user/assistant/tool
+	// messages in the original order.
+	if isResponsesEndpoint(req.SubPath) {
+		normalized, normErr := normalizeResponsesPayload(rewrittenBody)
+		if normErr != nil {
+			return nil, model, fmt.Errorf("failed to normalize responses payload: %w", normErr)
+		}
+		rewrittenBody = normalized
+	}
 
 	subPath := strings.TrimSpace(req.SubPath)
 	if subPath == "" {
@@ -2884,4 +2896,197 @@ func rewritePassthroughBody(rawBody []byte, model *models.LLMModel) ([]byte, err
 		return nil, fmt.Errorf("failed to encode rewritten passthrough body: %w", err)
 	}
 	return body, nil
+}
+
+// isResponsesEndpoint reports whether the passthrough sub path targets the
+// OpenAI Responses API and therefore needs message-role normalization.
+func isResponsesEndpoint(subPath string) bool {
+	p := strings.TrimSpace(strings.ToLower(subPath))
+	return p == "/responses" || strings.HasPrefix(p, "/responses/")
+}
+
+// normalizeResponsesPayload normalizes the `input` array of an OpenAI
+// Responses request body so downstream gateways that translate Responses ->
+// chat completions (Bifrost + Qwen, vLLM, ...) do not choke on:
+//
+//   - role "developer" (mapped to "system")
+//   - multiple system/developer messages (merged into one leading system
+//     message, separated by "\n\n", preserving original order)
+//   - unknown role values (mapped to "user")
+//   - empty / whitespace-only message content (dropped)
+//   - typed content blocks of unknown type (dropped per-block while
+//     keeping the surrounding message)
+//
+// Non-message input items (function_call, reasoning, tool_call_output,
+// computer_use, ...) are preserved in their original relative order after
+// the merged system message. If `input` is missing, a plain string, or not
+// a JSON array, the body is returned unchanged.
+func normalizeResponsesPayload(rawBody []byte) ([]byte, error) {
+	if len(bytes.TrimSpace(rawBody)) == 0 {
+		return rawBody, nil
+	}
+	payload := map[string]json.RawMessage{}
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		return rawBody, nil
+	}
+	inputRaw, exists := payload["input"]
+	if !exists || len(bytes.TrimSpace(inputRaw)) == 0 {
+		return rawBody, nil
+	}
+
+	var inputArray []json.RawMessage
+	if err := json.Unmarshal(inputRaw, &inputArray); err != nil {
+		// input is a plain string or some other JSON value; leave it alone.
+		return rawBody, nil
+	}
+
+	systemTexts := make([]string, 0)
+	outItems := make([]json.RawMessage, 0, len(inputArray))
+
+	for _, itemRaw := range inputArray {
+		probe := map[string]json.RawMessage{}
+		if err := json.Unmarshal(itemRaw, &probe); err != nil {
+			// Not a JSON object — pass through untouched.
+			outItems = append(outItems, itemRaw)
+			continue
+		}
+
+		itemType := ""
+		if rawType, ok := probe["type"]; ok {
+			_ = json.Unmarshal(rawType, &itemType)
+		}
+		roleRaw, hasRole := probe["role"]
+		contentRaw, hasContent := probe["content"]
+
+		// Treat anything with role+content (or explicit type=="message") as a
+		// chat message. Other typed items (function_call, reasoning, ...) are
+		// preserved verbatim so the upstream still sees them.
+		isMessage := strings.EqualFold(itemType, "message") || (itemType == "" && hasRole && hasContent)
+		if !isMessage {
+			outItems = append(outItems, itemRaw)
+			continue
+		}
+
+		role := ""
+		if hasRole {
+			_ = json.Unmarshal(roleRaw, &role)
+		}
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role == "developer" {
+			role = "system"
+		}
+		switch role {
+		case "system", "user", "assistant", "tool":
+			// known
+		default:
+			role = "user"
+		}
+
+		text := extractResponsesMessageText(contentRaw)
+		if strings.TrimSpace(text) == "" {
+			// Empty content message — drop it entirely.
+			continue
+		}
+
+		if role == "system" {
+			systemTexts = append(systemTexts, text)
+			continue
+		}
+
+		// Rebuild this message, preserving any extra fields the caller set
+		// (name, tool_call_id, function_call_id, ...). Only type/role/content
+		// are overwritten with the normalized values.
+		out := map[string]json.RawMessage{}
+		for k, v := range probe {
+			out[k] = v
+		}
+		typeRaw, _ := json.Marshal("message")
+		roleJSON, _ := json.Marshal(role)
+		contentJSON, _ := json.Marshal(text)
+		out["type"] = typeRaw
+		out["role"] = roleJSON
+		out["content"] = contentJSON
+
+		newRaw, err := json.Marshal(out)
+		if err != nil {
+			return nil, fmt.Errorf("failed to re-encode normalized message: %w", err)
+		}
+		outItems = append(outItems, newRaw)
+	}
+
+	finalItems := outItems
+	if len(systemTexts) > 0 {
+		merged := strings.Join(systemTexts, "\n\n")
+		systemItem := map[string]any{
+			"type":    "message",
+			"role":    "system",
+			"content": merged,
+		}
+		systemRaw, err := json.Marshal(systemItem)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode merged system message: %w", err)
+		}
+		finalItems = append([]json.RawMessage{systemRaw}, outItems...)
+	}
+
+	newInputRaw, err := json.Marshal(finalItems)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode normalized input array: %w", err)
+	}
+	payload["input"] = newInputRaw
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode normalized passthrough body: %w", err)
+	}
+	return body, nil
+}
+
+// extractResponsesMessageText flattens a Responses-API `content` field into a
+// single string. Accepts either a raw string, an array of strings, or an array
+// of typed content blocks (input_text, output_text, text). Unknown block
+// types are skipped silently.
+func extractResponsesMessageText(contentRaw json.RawMessage) string {
+	if len(bytes.TrimSpace(contentRaw)) == 0 {
+		return ""
+	}
+	var str string
+	if err := json.Unmarshal(contentRaw, &str); err == nil {
+		return str
+	}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(contentRaw, &blocks); err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, blockRaw := range blocks {
+		var s string
+		if err := json.Unmarshal(blockRaw, &s); err == nil {
+			if s != "" {
+				parts = append(parts, s)
+			}
+			continue
+		}
+		block := map[string]json.RawMessage{}
+		if err := json.Unmarshal(blockRaw, &block); err != nil {
+			continue
+		}
+		blockType := ""
+		if rawT, ok := block["type"]; ok {
+			_ = json.Unmarshal(rawT, &blockType)
+		}
+		switch strings.ToLower(strings.TrimSpace(blockType)) {
+		case "input_text", "output_text", "text":
+			text := ""
+			if rawText, ok := block["text"]; ok {
+				_ = json.Unmarshal(rawText, &text)
+			}
+			if text != "" {
+				parts = append(parts, text)
+			}
+		default:
+			// Unknown block type — drop silently so downstream doesn't reject.
+		}
+	}
+	return strings.Join(parts, "\n")
 }

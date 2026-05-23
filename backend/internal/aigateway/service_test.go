@@ -549,3 +549,188 @@ func TestRewritePassthroughBodyHandlesEmptyBody(t *testing.T) {
 		t.Fatalf("expected whitespace body to pass through unchanged, got %q (err=%v)", string(rewritten), err)
 	}
 }
+
+func TestNormalizeResponsesPayloadMergesDeveloperAndSystem(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5","input":[
+		{"type":"message","role":"developer","content":"You are X"},
+		{"type":"message","role":"system","content":"Stay polite"},
+		{"type":"message","role":"user","content":"hi"},
+		{"type":"message","role":"developer","content":"reply briefly"}
+	]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if len(decoded.Input) != 2 {
+		t.Fatalf("expected 2 items after normalize, got %d: %s", len(decoded.Input), string(normalized))
+	}
+	if decoded.Input[0]["role"] != "system" {
+		t.Fatalf("expected first item to be system, got %v", decoded.Input[0]["role"])
+	}
+	wantSystem := "You are X\n\nStay polite\n\nreply briefly"
+	if decoded.Input[0]["content"] != wantSystem {
+		t.Fatalf("unexpected merged system content: %v", decoded.Input[0]["content"])
+	}
+	if decoded.Input[1]["role"] != "user" || decoded.Input[1]["content"] != "hi" {
+		t.Fatalf("expected user message preserved, got %v", decoded.Input[1])
+	}
+}
+
+func TestNormalizeResponsesPayloadFlattensTypedContentBlocks(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"type":"message","role":"user","content":[
+			{"type":"input_text","text":"hello"},
+			{"type":"input_image","image_url":"data:..."},
+			{"type":"input_text","text":"world"}
+		]},
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"be brief"}]}
+	]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if len(decoded.Input) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(decoded.Input))
+	}
+	if decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != "be brief" {
+		t.Fatalf("unexpected system item: %v", decoded.Input[0])
+	}
+	if decoded.Input[1]["role"] != "user" || decoded.Input[1]["content"] != "hello\nworld" {
+		t.Fatalf("expected flattened user text, got %v", decoded.Input[1])
+	}
+}
+
+func TestNormalizeResponsesPayloadPreservesNonMessageItems(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"type":"message","role":"user","content":"hi"},
+		{"type":"function_call","call_id":"abc","name":"foo","arguments":"{}"},
+		{"type":"message","role":"developer","content":"be brief"},
+		{"type":"reasoning","summary":[{"text":"thinking"}]}
+	]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if len(decoded.Input) != 4 {
+		t.Fatalf("expected 4 items, got %d: %s", len(decoded.Input), string(normalized))
+	}
+	if decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != "be brief" {
+		t.Fatalf("expected merged system first, got %v", decoded.Input[0])
+	}
+	if decoded.Input[1]["type"] != "message" || decoded.Input[1]["role"] != "user" {
+		t.Fatalf("expected user message at position 1, got %v", decoded.Input[1])
+	}
+	if decoded.Input[2]["type"] != "function_call" {
+		t.Fatalf("expected function_call preserved at position 2, got %v", decoded.Input[2])
+	}
+	if decoded.Input[3]["type"] != "reasoning" {
+		t.Fatalf("expected reasoning preserved at position 3, got %v", decoded.Input[3])
+	}
+}
+
+func TestNormalizeResponsesPayloadDropsEmptyContent(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"type":"message","role":"user","content":""},
+		{"type":"message","role":"developer","content":"   "},
+		{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:..."}]},
+		{"type":"message","role":"assistant","content":"ok"}
+	]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if len(decoded.Input) != 1 {
+		t.Fatalf("expected only the assistant message to survive, got %d: %s", len(decoded.Input), string(normalized))
+	}
+	if decoded.Input[0]["role"] != "assistant" || decoded.Input[0]["content"] != "ok" {
+		t.Fatalf("expected assistant ok, got %v", decoded.Input[0])
+	}
+}
+
+func TestNormalizeResponsesPayloadMapsUnknownRoleToUser(t *testing.T) {
+	raw := []byte(`{"input":[{"role":"foobar","content":"weird"}]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if len(decoded.Input) != 1 || decoded.Input[0]["role"] != "user" {
+		t.Fatalf("expected single user message, got %v", decoded.Input)
+	}
+}
+
+func TestNormalizeResponsesPayloadIgnoresStringInput(t *testing.T) {
+	raw := []byte(`{"model":"x","input":"hello there"}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	if string(normalized) != string(raw) {
+		t.Fatalf("expected string input to pass through unchanged: %s", string(normalized))
+	}
+}
+
+func TestNormalizeResponsesPayloadPreservesExtraFields(t *testing.T) {
+	raw := []byte(`{"input":[
+		{"type":"message","role":"tool","content":"42","tool_call_id":"call_1"}
+	]}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode normalized body: %v", err)
+	}
+	if decoded.Input[0]["tool_call_id"] != "call_1" {
+		t.Fatalf("expected tool_call_id preserved, got %v", decoded.Input[0])
+	}
+}
+
+func TestIsResponsesEndpoint(t *testing.T) {
+	for _, p := range []string{"/responses", "/responses/", "/Responses", "/responses/abc/cancel"} {
+		if !isResponsesEndpoint(p) {
+			t.Fatalf("expected %q to be detected as responses endpoint", p)
+		}
+	}
+	for _, p := range []string{"/chat/completions", "/embeddings", "", "/responsesfoo"} {
+		if isResponsesEndpoint(p) {
+			t.Fatalf("expected %q NOT to be detected as responses endpoint", p)
+		}
+	}
+}
