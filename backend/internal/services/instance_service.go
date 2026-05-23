@@ -44,6 +44,9 @@ func (s *instanceService) ValidateCreateRequests(userID int, requests []CreateIn
 		if requests[idx].Name == "" {
 			return fmt.Errorf("instance name is required")
 		}
+		if strings.TrimSpace(requests[idx].Type) == "" {
+			requests[idx].Type = "openclaw"
+		}
 		environmentOverrides, err := normalizeEnvironmentOverrides(requests[idx].EnvironmentOverrides)
 		if err != nil {
 			return err
@@ -131,7 +134,7 @@ func (s *instanceService) ValidateCreateRequests(userID int, requests []CreateIn
 type CreateInstanceRequest struct {
 	Name                 string              `json:"name" validate:"required,min=3,max=50"`
 	Description          *string             `json:"description,omitempty"`
-	Type                 string              `json:"type" validate:"required,oneof=openclaw ubuntu debian centos custom webtop hermes"`
+	Type                 string              `json:"type" validate:"omitempty,oneof=openclaw ubuntu debian centos custom webtop hermes"`
 	RuntimeType          string              `json:"runtime_type" validate:"omitempty,oneof=desktop shell"`
 	CPUCores             float64             `json:"cpu_cores" validate:"required,min=0.1,max=32"`
 	MemoryGB             int                 `json:"memory_gb" validate:"required,min=1,max=128"`
@@ -228,6 +231,11 @@ func NewInstanceService(instanceRepo repository.InstanceRepository, quotaRepo re
 func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models.Instance, error) {
 	ctx := context.Background()
 	req.Name = strings.TrimSpace(req.Name)
+	// Default to OpenClaw when the caller omits `type`, so pre-2026.05 external
+	// clients keep working without changes (csotai compatibility).
+	if strings.TrimSpace(req.Type) == "" {
+		req.Type = "openclaw"
+	}
 	environmentOverrides, err := normalizeEnvironmentOverrides(req.EnvironmentOverrides)
 	if err != nil {
 		return nil, err
