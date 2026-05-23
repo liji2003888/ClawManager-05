@@ -1364,6 +1364,17 @@ func buildOpenAICompatibleRequestBody(req ChatCompletionRequest, model *models.L
 		return nil, fmt.Errorf("failed to encode provider model name: %w", err)
 	}
 	payload["model"] = json.RawMessage(modelPayload)
+
+	// Normalize the messages array so providers that require a single
+	// leading system message (Qwen, vLLM/openai-compatible adapters) accept
+	// the request even when the caller sent role=developer or interleaved
+	// system messages.
+	if rawMessages, ok := payload["messages"]; ok {
+		if normalizedMessages, normErr := normalizeChatMessages(rawMessages); normErr == nil && normalizedMessages != nil {
+			payload["messages"] = normalizedMessages
+		}
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode provider request: %w", err)
@@ -2929,8 +2940,41 @@ func normalizeResponsesPayload(rawBody []byte) ([]byte, error) {
 	if err := json.Unmarshal(rawBody, &payload); err != nil {
 		return rawBody, nil
 	}
+
+	// Pull the top-level `instructions` field (OpenAI Responses API treats it
+	// as the highest-priority system message) so it can be folded into the
+	// leading merged system item below. Removing it after the merge prevents
+	// downstream gateways from re-inserting it at the wrong position in the
+	// translated chat completions request.
+	leadingSystemTexts := make([]string, 0, 2)
+	if instructionsRaw, ok := payload["instructions"]; ok && len(bytes.TrimSpace(instructionsRaw)) > 0 {
+		if text := extractResponsesMessageText(instructionsRaw); strings.TrimSpace(text) != "" {
+			leadingSystemTexts = append(leadingSystemTexts, text)
+		}
+	}
+
 	inputRaw, exists := payload["input"]
 	if !exists || len(bytes.TrimSpace(inputRaw)) == 0 {
+		if len(leadingSystemTexts) > 0 {
+			// instructions-only request: inline it as input so the upstream
+			// receives a well-ordered Responses payload.
+			systemItem := map[string]any{
+				"type":    "message",
+				"role":    "system",
+				"content": strings.Join(leadingSystemTexts, "\n\n"),
+			}
+			systemRaw, err := json.Marshal(systemItem)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encode instructions system message: %w", err)
+			}
+			arr, err := json.Marshal([]json.RawMessage{systemRaw})
+			if err != nil {
+				return nil, err
+			}
+			payload["input"] = arr
+			delete(payload, "instructions")
+			return json.Marshal(payload)
+		}
 		return rawBody, nil
 	}
 
@@ -2940,7 +2984,7 @@ func normalizeResponsesPayload(rawBody []byte) ([]byte, error) {
 		return rawBody, nil
 	}
 
-	systemTexts := make([]string, 0)
+	systemTexts := append([]string{}, leadingSystemTexts...)
 	outItems := make([]json.RawMessage, 0, len(inputArray))
 
 	for _, itemRaw := range inputArray {
@@ -3034,6 +3078,9 @@ func normalizeResponsesPayload(rawBody []byte) ([]byte, error) {
 		return nil, fmt.Errorf("failed to encode normalized input array: %w", err)
 	}
 	payload["input"] = newInputRaw
+	// Strip the original instructions field so downstream gateways don't
+	// translate it a second time into a misordered system message.
+	delete(payload, "instructions")
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -3089,4 +3136,119 @@ func extractResponsesMessageText(contentRaw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// normalizeChatMessages normalizes the `messages` array of an OpenAI Chat
+// Completions request so providers that require a single leading system
+// message (Qwen / 通义千问, vLLM "openai-compatible" adapters, some Bifrost
+// translation paths) accept the request.
+//
+// Rules:
+//   - role="developer" -> role="system"
+//   - all system messages are merged into ONE leading system message,
+//     joined with "\n\n" in original order
+//   - unknown role values are mapped to "user"
+//   - messages with empty / whitespace-only content are dropped
+//   - typed content blocks of unknown type are dropped per-block (known:
+//     text, input_text, output_text; raw strings preserved)
+//   - extra fields (name, tool_calls, tool_call_id, function_call, ...)
+//     survive — only role/content are rewritten on touched messages
+//
+// If `messages` is not a JSON array, the input is returned unchanged.
+func normalizeChatMessages(messagesRaw json.RawMessage) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(messagesRaw)) == 0 {
+		return messagesRaw, nil
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(messagesRaw, &items); err != nil {
+		return messagesRaw, nil
+	}
+
+	systemTexts := make([]string, 0)
+	outItems := make([]json.RawMessage, 0, len(items))
+
+	for _, itemRaw := range items {
+		probe := map[string]json.RawMessage{}
+		if err := json.Unmarshal(itemRaw, &probe); err != nil {
+			outItems = append(outItems, itemRaw)
+			continue
+		}
+
+		roleRaw, hasRole := probe["role"]
+		contentRaw, hasContent := probe["content"]
+		_, hasToolCalls := probe["tool_calls"]
+
+		if !hasRole {
+			outItems = append(outItems, itemRaw)
+			continue
+		}
+
+		role := ""
+		_ = json.Unmarshal(roleRaw, &role)
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role == "developer" {
+			role = "system"
+		}
+		switch role {
+		case "system", "user", "assistant", "tool":
+			// known
+		default:
+			role = "user"
+		}
+
+		text := ""
+		if hasContent {
+			text = extractResponsesMessageText(contentRaw)
+		}
+		// Assistant messages with tool_calls but no content are valid in chat
+		// completions — preserve them verbatim.
+		if strings.TrimSpace(text) == "" && !hasToolCalls {
+			continue
+		}
+
+		if role == "system" {
+			if strings.TrimSpace(text) != "" {
+				systemTexts = append(systemTexts, text)
+			}
+			continue
+		}
+
+		out := map[string]json.RawMessage{}
+		for k, v := range probe {
+			out[k] = v
+		}
+		roleJSON, _ := json.Marshal(role)
+		out["role"] = roleJSON
+		if hasContent && strings.TrimSpace(text) != "" {
+			contentJSON, _ := json.Marshal(text)
+			out["content"] = contentJSON
+		}
+		// If content is absent but tool_calls are present, leave content as-is
+		// (some providers require explicit null content for tool_call replies).
+		newRaw, err := json.Marshal(out)
+		if err != nil {
+			return nil, fmt.Errorf("failed to re-encode normalized chat message: %w", err)
+		}
+		outItems = append(outItems, newRaw)
+	}
+
+	finalItems := outItems
+	if len(systemTexts) > 0 {
+		merged := strings.Join(systemTexts, "\n\n")
+		systemItem := map[string]any{
+			"role":    "system",
+			"content": merged,
+		}
+		systemRaw, err := json.Marshal(systemItem)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode merged chat system message: %w", err)
+		}
+		finalItems = append([]json.RawMessage{systemRaw}, outItems...)
+	}
+
+	encoded, err := json.Marshal(finalItems)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode normalized messages array: %w", err)
+	}
+	return encoded, nil
 }

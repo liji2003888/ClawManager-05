@@ -734,3 +734,117 @@ func TestIsResponsesEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeChatMessagesMergesDeveloperAndSystem(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"role":"developer","content":"You are X"},
+		{"role":"user","content":"hi"},
+		{"role":"system","content":"Be brief"},
+		{"role":"assistant","content":"ok"}
+	]`)
+	normalized, err := normalizeChatMessages(raw)
+	if err != nil {
+		t.Fatalf("normalizeChatMessages returned error: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if len(decoded) != 3 {
+		t.Fatalf("expected 3 messages (merged system + user + assistant), got %d: %s", len(decoded), string(normalized))
+	}
+	if decoded[0]["role"] != "system" || decoded[0]["content"] != "You are X\n\nBe brief" {
+		t.Fatalf("unexpected leading system: %v", decoded[0])
+	}
+	if decoded[1]["role"] != "user" || decoded[1]["content"] != "hi" {
+		t.Fatalf("unexpected user message: %v", decoded[1])
+	}
+	if decoded[2]["role"] != "assistant" {
+		t.Fatalf("expected assistant preserved at end, got %v", decoded[2])
+	}
+}
+
+func TestNormalizeChatMessagesPreservesToolCallsWithEmptyContent(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"role":"user","content":"call foo"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"1","type":"function","function":{"name":"foo","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"1","content":"42"}
+	]`)
+	normalized, err := normalizeChatMessages(raw)
+	if err != nil {
+		t.Fatalf("normalizeChatMessages returned error: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if len(decoded) != 3 {
+		t.Fatalf("expected 3 messages preserved (no system), got %d", len(decoded))
+	}
+	if decoded[1]["role"] != "assistant" {
+		t.Fatalf("expected assistant tool_call to survive, got %v", decoded[1])
+	}
+	if _, ok := decoded[1]["tool_calls"]; !ok {
+		t.Fatalf("expected tool_calls preserved")
+	}
+	if decoded[2]["tool_call_id"] != "1" {
+		t.Fatalf("expected tool_call_id preserved on tool message, got %v", decoded[2])
+	}
+}
+
+func TestNormalizeResponsesPayloadFoldsInstructionsIntoSystem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5",
+		"instructions":"You are X",
+		"input":[
+			{"type":"message","role":"developer","content":"Be brief"},
+			{"type":"message","role":"user","content":"hi"}
+		]
+	}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+
+	var decoded struct {
+		Instructions any              `json:"instructions"`
+		Input        []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if decoded.Instructions != nil {
+		t.Fatalf("expected instructions to be stripped after folding, got %v", decoded.Instructions)
+	}
+	if len(decoded.Input) != 2 {
+		t.Fatalf("expected 2 input items, got %d: %s", len(decoded.Input), string(normalized))
+	}
+	want := "You are X\n\nBe brief"
+	if decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != want {
+		t.Fatalf("expected merged leading system %q, got %v", want, decoded.Input[0])
+	}
+	if decoded.Input[1]["role"] != "user" || decoded.Input[1]["content"] != "hi" {
+		t.Fatalf("expected user preserved, got %v", decoded.Input[1])
+	}
+}
+
+func TestNormalizeResponsesPayloadInstructionsOnly(t *testing.T) {
+	raw := []byte(`{"instructions":"behave"}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	var decoded struct {
+		Instructions any              `json:"instructions"`
+		Input        []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if decoded.Instructions != nil {
+		t.Fatalf("expected instructions stripped, got %v", decoded.Instructions)
+	}
+	if len(decoded.Input) != 1 || decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != "behave" {
+		t.Fatalf("expected single inlined system message, got %v", decoded.Input)
+	}
+}
