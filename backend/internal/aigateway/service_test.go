@@ -496,3 +496,56 @@ func TestNormalizeExistingIdentifierHashesLongOpenClawSessionKeys(t *testing.T) 
 		t.Fatalf("expected normalized id length <= %d, got %d", maxStoredIdentifierLength, len(normalized))
 	}
 }
+
+func TestRewritePassthroughBodyReplacesModelWithProviderName(t *testing.T) {
+	model := &models.LLMModel{
+		DisplayName:       "codex",
+		ProviderModelName: "gpt-5-codex",
+	}
+	raw := []byte(`{"model":"auto","input":[{"role":"user","content":"hi"}],"session_id":"abc","stream":true}`)
+
+	rewritten, err := rewritePassthroughBody(raw, model)
+	if err != nil {
+		t.Fatalf("rewritePassthroughBody returned error: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rewritten, &payload); err != nil {
+		t.Fatalf("failed to decode rewritten body: %v", err)
+	}
+	if payload["model"] != "gpt-5-codex" {
+		t.Fatalf("expected model to be rewritten to gpt-5-codex, got %v", payload["model"])
+	}
+	if _, exists := payload["session_id"]; exists {
+		t.Fatalf("expected session_id to be stripped from passthrough body")
+	}
+	if payload["stream"] != true {
+		t.Fatalf("expected stream flag to be preserved, got %v", payload["stream"])
+	}
+	if _, exists := payload["input"]; !exists {
+		t.Fatalf("expected input field to be preserved")
+	}
+}
+
+func TestRewritePassthroughBodyKeepsNonJSONBodyAsIs(t *testing.T) {
+	model := &models.LLMModel{ProviderModelName: "gpt-5"}
+	raw := []byte("not-json")
+	rewritten, err := rewritePassthroughBody(raw, model)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(rewritten) != "not-json" {
+		t.Fatalf("expected non-JSON body to pass through unchanged, got %q", string(rewritten))
+	}
+}
+
+func TestRewritePassthroughBodyHandlesEmptyBody(t *testing.T) {
+	model := &models.LLMModel{ProviderModelName: "gpt-5"}
+	if rewritten, err := rewritePassthroughBody(nil, model); err != nil || rewritten != nil {
+		t.Fatalf("expected nil body to pass through, got %q (err=%v)", string(rewritten), err)
+	}
+	empty := []byte("   ")
+	if rewritten, err := rewritePassthroughBody(empty, model); err != nil || string(rewritten) != "   " {
+		t.Fatalf("expected whitespace body to pass through unchanged, got %q (err=%v)", string(rewritten), err)
+	}
+}

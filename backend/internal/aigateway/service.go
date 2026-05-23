@@ -2740,6 +2740,15 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 		return nil, model, err
 	}
 
+	// Rewrite the request body so the upstream provider receives the real
+	// provider_model_name instead of ClawManager's display name (or "auto").
+	// Also strip ClawManager-internal fields. This mirrors what
+	// buildOpenAICompatibleRequestBody does for /chat/completions.
+	rewrittenBody, err := rewritePassthroughBody(req.RawBody, model)
+	if err != nil {
+		return nil, model, err
+	}
+
 	subPath := strings.TrimSpace(req.SubPath)
 	if subPath == "" {
 		return nil, model, errors.New("passthrough sub path is required")
@@ -2749,7 +2758,7 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 	}
 	endpoint := strings.TrimRight(strings.TrimSpace(model.BaseURL), "/") + subPath
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(req.RawBody))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(rewrittenBody))
 	if err != nil {
 		return nil, model, fmt.Errorf("failed to build provider request: %w", err)
 	}
@@ -2802,4 +2811,44 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 		return nil, model, fmt.Errorf("provider call failed: %w", err)
 	}
 	return response, model, nil
+}
+
+// rewritePassthroughBody decodes a passthrough body, swaps the `model` field
+// with the resolved provider_model_name, and strips ClawManager-internal
+// session/instance/trace/request fields. Bodies that fail to parse as JSON
+// are passed through unchanged so non-JSON formats (form-encoded, binary)
+// still work.
+func rewritePassthroughBody(rawBody []byte, model *models.LLMModel) ([]byte, error) {
+	if model == nil {
+		return rawBody, nil
+	}
+	if len(bytes.TrimSpace(rawBody)) == 0 {
+		return rawBody, nil
+	}
+
+	payload := map[string]json.RawMessage{}
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		// Not a JSON object — let the upstream provider handle it as-is.
+		return rawBody, nil
+	}
+	if payload == nil {
+		payload = map[string]json.RawMessage{}
+	}
+
+	delete(payload, "session_id")
+	delete(payload, "instance_id")
+	delete(payload, "trace_id")
+	delete(payload, "request_id")
+
+	modelPayload, err := json.Marshal(model.ProviderModelName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode provider model name: %w", err)
+	}
+	payload["model"] = json.RawMessage(modelPayload)
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode rewritten passthrough body: %w", err)
+	}
+	return body, nil
 }
