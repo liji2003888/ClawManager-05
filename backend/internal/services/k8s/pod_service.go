@@ -402,7 +402,10 @@ touch "$SENTINEL"`},
 		pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
 	}
 
-	// Add sidecar container for openclaw instances (csotai customization)
+	// Add sidecar container for managed-runtime instances (openclaw / hermes).
+	// The sidecar always mounts the PVC root at /config so it can read every
+	// subtree (.openclaw, .hermes, workspace, skills...) regardless of where
+	// the main container chose to mount the PVC. (csotai customization)
 	if config.SidecarEnabled && config.SidecarImage != "" {
 		sidecarContainer := corev1.Container{
 			Name:            "sidecar",
@@ -432,6 +435,14 @@ touch "$SENTINEL"`},
 				{
 					Name:  "USER_ID",
 					Value: fmt.Sprintf("%d", config.UserID),
+				},
+				{
+					Name:  "INSTANCE_TYPE",
+					Value: config.Type,
+				},
+				{
+					Name:  "INSTANCE_MOUNT_PATH",
+					Value: config.MountPath,
 				},
 			},
 		}

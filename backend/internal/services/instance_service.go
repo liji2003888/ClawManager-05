@@ -484,7 +484,7 @@ func (s *instanceService) Create(userID int, req CreateInstanceRequest) (*models
 
 	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
 	sidecarImage := defaultSidecarImage()
-	enableSidecar := strings.EqualFold(instance.Type, "openclaw") && sidecarImage != ""
+	enableSidecar := supportsManagedRuntimeIntegration(instance.Type) && sidecarImage != ""
 	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
 	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
 	initContainerToken := ""
@@ -685,7 +685,7 @@ func (s *instanceService) Start(instanceID int) error {
 
 	// Prepare sidecar / initContainer for openclaw cross-cluster integration (csotai customization)
 	sidecarImage := defaultSidecarImage()
-	enableSidecar := strings.EqualFold(instance.Type, "openclaw") && sidecarImage != ""
+	enableSidecar := supportsManagedRuntimeIntegration(instance.Type) && sidecarImage != ""
 	openClawSeedImage := strings.TrimSpace(os.Getenv("OPENCLAW_SEED_IMAGE"))
 	enableInitContainer := strings.EqualFold(instance.Type, "openclaw") && openClawSeedImage != ""
 	initContainerToken := ""
