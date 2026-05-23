@@ -723,12 +723,30 @@ func TestNormalizeResponsesPayloadPreservesExtraFields(t *testing.T) {
 }
 
 func TestIsResponsesEndpoint(t *testing.T) {
-	for _, p := range []string{"/responses", "/responses/", "/Responses", "/responses/abc/cancel"} {
+	positives := []string{
+		"/responses",
+		"/responses/",
+		"/Responses",
+		"/responses/abc/cancel",
+		"/v1/responses",
+		"/v1/responses/",
+		"/v1/responses/abc/cancel",
+		"/v2/responses",
+	}
+	for _, p := range positives {
 		if !isResponsesEndpoint(p) {
 			t.Fatalf("expected %q to be detected as responses endpoint", p)
 		}
 	}
-	for _, p := range []string{"/chat/completions", "/embeddings", "", "/responsesfoo"} {
+	negatives := []string{
+		"/chat/completions",
+		"/v1/chat/completions",
+		"/embeddings",
+		"",
+		"/responsesfoo",
+		"/v1/embeddings",
+	}
+	for _, p := range negatives {
 		if isResponsesEndpoint(p) {
 			t.Fatalf("expected %q NOT to be detected as responses endpoint", p)
 		}
@@ -789,5 +807,74 @@ func TestNormalizeResponsesPayloadInstructionsOnly(t *testing.T) {
 	}
 	if len(decoded.Input) != 1 || decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != "behave" {
 		t.Fatalf("expected single inlined system message, got %v", decoded.Input)
+	}
+}
+
+func TestNormalizeResponsesPayloadInstructionsPlusUserOnly(t *testing.T) {
+	// Real codex CLI scenario: top-level instructions + only user message in input.
+	raw := []byte(`{
+		"model":"gpt-5",
+		"instructions":"You are a coding agent.",
+		"input":[{"type":"message","role":"user","content":"refactor foo.go"}]
+	}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	var decoded struct {
+		Instructions any              `json:"instructions"`
+		Input        []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if decoded.Instructions != nil {
+		t.Fatalf("expected instructions stripped, got %v", decoded.Instructions)
+	}
+	if len(decoded.Input) != 2 {
+		t.Fatalf("expected 2 input items (system + user), got %d: %s", len(decoded.Input), string(normalized))
+	}
+	if decoded.Input[0]["role"] != "system" {
+		t.Fatalf("expected input[0] role=system, got %v", decoded.Input[0]["role"])
+	}
+	if decoded.Input[0]["content"] != "You are a coding agent." {
+		t.Fatalf("expected input[0] content from instructions, got %v", decoded.Input[0]["content"])
+	}
+	if decoded.Input[1]["role"] != "user" {
+		t.Fatalf("expected input[1] role=user, got %v", decoded.Input[1]["role"])
+	}
+}
+
+func TestNormalizeResponsesPayloadOrderAfterInterleavedSystem(t *testing.T) {
+	raw := []byte(`{
+		"input":[
+			{"type":"message","role":"user","content":"step 1"},
+			{"type":"message","role":"assistant","content":"ok"},
+			{"type":"message","role":"system","content":"reminder"},
+			{"type":"message","role":"user","content":"step 2"}
+		]
+	}`)
+	normalized, err := normalizeResponsesPayload(raw)
+	if err != nil {
+		t.Fatalf("normalizeResponsesPayload returned error: %v", err)
+	}
+	var decoded struct {
+		Input []map[string]any `json:"input"`
+	}
+	if err := json.Unmarshal(normalized, &decoded); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+	if len(decoded.Input) != 4 {
+		t.Fatalf("expected 4 items (system + 3 others), got %d: %s", len(decoded.Input), string(normalized))
+	}
+	if decoded.Input[0]["role"] != "system" || decoded.Input[0]["content"] != "reminder" {
+		t.Fatalf("expected system extracted to position 0, got %v", decoded.Input[0])
+	}
+	roles := []any{decoded.Input[1]["role"], decoded.Input[2]["role"], decoded.Input[3]["role"]}
+	want := []any{"user", "assistant", "user"}
+	for i := range want {
+		if roles[i] != want[i] {
+			t.Fatalf("expected position %d role=%v, got %v (full: %s)", i+1, want[i], roles[i], string(normalized))
+		}
 	}
 }

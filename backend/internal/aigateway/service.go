@@ -2759,7 +2759,13 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 		if normErr != nil {
 			return nil, model, fmt.Errorf("failed to normalize responses payload: %w", normErr)
 		}
+		if passthroughDebugEnabled() {
+			log.Printf("ai gateway passthrough: normalized responses payload (sub_path=%s, before=%d bytes, after=%d bytes)",
+				req.SubPath, len(rewrittenBody), len(normalized))
+		}
 		rewrittenBody = normalized
+	} else if passthroughDebugEnabled() {
+		log.Printf("ai gateway passthrough: skipping responses normalization (sub_path=%q does not look like /responses)", req.SubPath)
 	}
 
 	subPath := strings.TrimSpace(req.SubPath)
@@ -2829,12 +2835,23 @@ func (s *service) Passthrough(ctx context.Context, userID int, req PassthroughRe
 		return nil, model, fmt.Errorf("provider call failed: %w", err)
 	}
 
-	if passthroughDebugEnabled() && response.StatusCode >= 400 {
+	// Always surface upstream 4xx/5xx with both request and response bodies so
+	// errors like Bifrost/Qwen "system message must be at the beginning" are
+	// immediately diagnosable from backend logs, even without
+	// GATEWAY_PASSTHROUGH_DEBUG. Bodies are truncated to 1 KB by default to
+	// keep production logs bounded; raise the limit by enabling debug mode.
+	if response.StatusCode >= 400 {
 		bodyBytes, peekErr := io.ReadAll(response.Body)
 		response.Body.Close()
+		limit := 1024
+		if passthroughDebugEnabled() {
+			limit = 4096
+		}
 		if peekErr == nil {
-			log.Printf("ai gateway passthrough: upstream %d for %s (model=%s): %s",
-				response.StatusCode, endpoint, model.DisplayName, summarizeForLog(bodyBytes, 4096))
+			log.Printf("ai gateway passthrough: upstream %d for %s (model=%s) request=%s response=%s",
+				response.StatusCode, endpoint, model.DisplayName,
+				summarizeForLog(rewrittenBody, limit),
+				summarizeForLog(bodyBytes, limit))
 		}
 		response.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
@@ -2900,9 +2917,23 @@ func rewritePassthroughBody(rawBody []byte, model *models.LLMModel) ([]byte, err
 
 // isResponsesEndpoint reports whether the passthrough sub path targets the
 // OpenAI Responses API and therefore needs message-role normalization.
+// Accepts "/responses", "/responses/...", "/v1/responses", and any version
+// prefix variant a caller might supply (e.g. when wiring the gateway
+// behind a generic "/v1/*" proxy).
 func isResponsesEndpoint(subPath string) bool {
 	p := strings.TrimSpace(strings.ToLower(subPath))
-	return p == "/responses" || strings.HasPrefix(p, "/responses/")
+	if p == "" {
+		return false
+	}
+	// Strip any leading slash + optional version prefix like "v1", "v2".
+	trimmed := strings.TrimPrefix(p, "/")
+	if idx := strings.Index(trimmed, "/"); idx > 0 {
+		head := trimmed[:idx]
+		if len(head) >= 2 && head[0] == 'v' && head[1] >= '0' && head[1] <= '9' {
+			trimmed = trimmed[idx+1:]
+		}
+	}
+	return trimmed == "responses" || strings.HasPrefix(trimmed, "responses/")
 }
 
 // normalizeResponsesPayload normalizes the `input` array of an OpenAI
